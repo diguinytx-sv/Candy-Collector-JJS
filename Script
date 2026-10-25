@@ -1,0 +1,1334 @@
+-- CANDY COLLECTOR V1
+-- Jujutsu Shenanigans | Arceus X | Android
+-- Correções: ghostPart position, loop lifecycle, câmera respawn,
+--            slider mobile, conexões globais, detecção de portas
+
+local Players          = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService       = game:GetService("RunService")
+local TweenService     = game:GetService("TweenService")
+local VirtualUser      = game:GetService("VirtualUser")
+
+local player  = Players.LocalPlayer
+local camera  = workspace.CurrentCamera
+local FONT    = Font.fromId(12187375716)
+
+-- ═══════════════════════════════════════════
+-- ASSETS
+-- ═══════════════════════════════════════════
+local STUDS_ID = "rbxassetid://124082587329594"
+local CLICK_ID = "rbxassetid://139719503904449"
+
+-- ═══════════════════════════════════════════
+-- COORDENADAS
+-- ═══════════════════════════════════════════
+local TowerPosition = Vector3.new(
+    1219.3323974609375,
+    309.67169189453125,
+    818.4990234375
+)
+
+-- ═══════════════════════════════════════════
+-- SOM — clone por clique, sem cortar som anterior
+-- ═══════════════════════════════════════════
+local clickTemplate   = Instance.new("Sound")
+clickTemplate.SoundId = CLICK_ID
+clickTemplate.Volume  = 0.5
+clickTemplate.Parent  = workspace
+
+local function playClick()
+    local s = clickTemplate:Clone()
+    s.Parent = workspace
+    s:Play()
+    game:GetService("Debris"):AddItem(s, 2)
+end
+
+-- ═══════════════════════════════════════════
+-- ESTADO GLOBAL
+-- ═══════════════════════════════════════════
+local State = {
+    autoCandy      = false,
+    autoPrompt     = false,
+    invis          = false,
+    instantDoor    = false,
+    speedBoost     = false,
+    tweenSpeed     = 0.8,
+    originalSpeed  = 16,
+    originalCamSubject = nil,
+}
+
+-- Controle de ciclo de vida dos loops
+local LoopFlags = {
+    autoCandy  = false,   -- flag que o loop lê pra saber se para
+    autoPrompt = false,
+}
+
+local Connections = {
+    ghost        = nil,
+    instantWatch = nil,
+}
+
+-- Conexões globais criadas pelos sliders — limpas ao fechar
+local GlobalConnections = {}
+
+local ghostPart         = nil
+local activeCandyTween  = nil   -- tween atual do Auto Candy
+
+-- ═══════════════════════════════════════════
+-- HELPERS
+-- ═══════════════════════════════════════════
+local function getHRP()
+    local c = player.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function getHumanoid()
+    local c = player.Character
+    return c and c:FindFirstChildOfClass("Humanoid")
+end
+
+-- ═══════════════════════════════════════════
+-- ANTI-AFK — protegido por pcall
+-- ═══════════════════════════════════════════
+player.Idled:Connect(function()
+    pcall(function()
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton2(Vector2.new())
+    end)
+end)
+
+-- ═══════════════════════════════════════════
+-- DETECÇÃO DE PORTAS
+-- Busca Part "door" com ProximityPrompt filho direto
+-- Valida se a referência ainda existe antes de retornar
+-- ═══════════════════════════════════════════
+local function getDoorPrompts()
+    local result = {}
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj.Name == "door"
+            and obj:IsA("BasePart")
+            and obj.Parent  -- ainda existe no Workspace
+        then
+            local prompt = obj:FindFirstChildOfClass("ProximityPrompt")
+            if prompt then
+                table.insert(result, { part = obj, prompt = prompt })
+            end
+        end
+    end
+    return result
+end
+
+local function firePromptSafe(prompt)
+    if not prompt or not prompt.Parent then return end
+    local orig = prompt.MaxActivationDistance
+    prompt.MaxActivationDistance = math.huge
+    pcall(function() fireproximityprompt(prompt) end)
+    task.wait(0.05)
+    if prompt and prompt.Parent then
+        prompt.MaxActivationDistance = orig
+    end
+end
+
+-- ═══════════════════════════════════════════
+-- INSTANT DOOR
+-- ═══════════════════════════════════════════
+local instantDoorOriginals = {}
+
+local function applyInstantDoor()
+    local doors = getDoorPrompts()
+    for _, d in ipairs(doors) do
+        if not instantDoorOriginals[d.prompt] then
+            instantDoorOriginals[d.prompt] = d.prompt.HoldDuration
+        end
+        d.prompt.HoldDuration = 0
+    end
+end
+
+local function removeInstantDoor()
+    for prompt, original in pairs(instantDoorOriginals) do
+        if prompt and prompt.Parent then
+            prompt.HoldDuration = original
+        end
+    end
+    instantDoorOriginals = {}
+end
+
+local function startInstantDoorWatcher()
+    if Connections.instantWatch then
+        Connections.instantWatch:Disconnect()
+    end
+    Connections.instantWatch = workspace.DescendantAdded:Connect(function(obj)
+        if not State.instantDoor then return end
+        if obj.Name == "door" and obj:IsA("BasePart") then
+            -- Aguarda até o ProximityPrompt existir (até 2s)
+            local attempts = 0
+            repeat
+                task.wait(0.2)
+                attempts = attempts + 1
+                local prompt = obj:FindFirstChildOfClass("ProximityPrompt")
+                if prompt then
+                    instantDoorOriginals[prompt] = prompt.HoldDuration
+                    prompt.HoldDuration = 0
+                    break
+                end
+            until attempts >= 10
+        end
+    end)
+end
+
+local function stopInstantDoorWatcher()
+    if Connections.instantWatch then
+        Connections.instantWatch:Disconnect()
+        Connections.instantWatch = nil
+    end
+end
+
+-- ═══════════════════════════════════════════
+-- AUTO CANDY
+-- FIX: flag de controle de loop + cancelamento de tween ativo
+-- FIX: confirmação de coleta por desaparecimento da Part
+-- ═══════════════════════════════════════════
+local function startAutoCandy()
+    -- Garante que loop anterior terminou
+    if LoopFlags.autoCandy then return end
+    LoopFlags.autoCandy = true
+
+    task.spawn(function()
+        while LoopFlags.autoCandy do
+            local doors = getDoorPrompts()
+
+            if #doors == 0 then
+                task.wait(2)
+                continue
+            end
+
+            for _, d in ipairs(doors) do
+                if not LoopFlags.autoCandy then break end
+
+                -- Valida referência antes de usar
+                if not d.part.Parent or not d.prompt.Parent then
+                    continue
+                end
+
+                local hrp = getHRP()
+                if not hrp then break end
+
+                local dest = CFrame.new(
+                    d.part.Position + Vector3.new(0, 4, 0)
+                )
+
+                -- Cancela tween anterior se ainda estiver rodando
+                if activeCandyTween then
+                    activeCandyTween:Cancel()
+                    activeCandyTween = nil
+                end
+
+                activeCandyTween = TweenService:Create(
+                    hrp,
+                    TweenInfo.new(
+                        State.tweenSpeed,
+                        Enum.EasingStyle.Quad,
+                        Enum.EasingDirection.Out
+                    ),
+                    { CFrame = dest }
+                )
+                activeCandyTween:Play()
+                activeCandyTween.Completed:Wait()
+                activeCandyTween = nil
+
+                if not LoopFlags.autoCandy then break end
+
+                -- Dispara o prompt
+                firePromptSafe(d.prompt)
+
+                -- FIX: confirmação real — espera a Part desaparecer
+                -- (quando a porta abre, a Part "door" é removida ou muda de Parent)
+                local timeout  = tick() + 3
+                local partRef  = d.part
+                repeat
+                    task.wait(0.15)
+                until not partRef.Parent or tick() > timeout
+
+                task.wait(0.3)
+            end
+
+            task.wait(1.5)
+        end
+    end)
+end
+
+local function stopAutoCandy()
+    LoopFlags.autoCandy = false
+    State.autoCandy     = false
+    -- Cancela tween em andamento
+    if activeCandyTween then
+        activeCandyTween:Cancel()
+        activeCandyTween = nil
+    end
+end
+
+-- ═══════════════════════════════════════════
+-- AUTO PROMPT
+-- FIX: flag de ciclo de vida + só portas confirmadas
+-- ═══════════════════════════════════════════
+local function startAutoPrompt()
+    if LoopFlags.autoPrompt then return end
+    LoopFlags.autoPrompt = true
+
+    task.spawn(function()
+        while LoopFlags.autoPrompt do
+            for _, obj in ipairs(workspace:GetDescendants()) do
+                if not LoopFlags.autoPrompt then break end
+                if obj:IsA("ProximityPrompt") then
+                    pcall(function() fireproximityprompt(obj) end)
+                end
+            end
+            task.wait(0.5)
+        end
+    end)
+end
+
+local function stopAutoPrompt()
+    LoopFlags.autoPrompt = false
+    State.autoPrompt     = false
+end
+
+-- ═══════════════════════════════════════════
+-- FIRE PP
+-- ═══════════════════════════════════════════
+local function fireAllPP()
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("ProximityPrompt") then
+            pcall(function() fireproximityprompt(obj) end)
+        end
+    end
+end
+
+-- ═══════════════════════════════════════════
+-- DOOR INVISIBILITY
+-- FIX: salva posição ANTES de mover o HRP
+-- FIX: CameraSubject = ghostPart (câmera livre)
+-- FIX: MoveDirection sem dupla transformação
+-- ═══════════════════════════════════════════
+local function startInvis()
+    local hrp  = getHRP()
+    local char = player.Character
+    local hum  = getHumanoid()
+    if not hrp or not char or not hum then return end
+
+    -- FIX: salva posição ANTES de qualquer movimento
+    local originalPosition = hrp.Position
+
+    State.originalCamSubject = camera.CameraSubject
+
+    -- Esconde o corpo
+    for _, p in ipairs(char:GetDescendants()) do
+        if p:IsA("BasePart") then
+            p.LocalTransparencyModifier = 1
+        end
+    end
+
+    -- Ancora o corpo em Y=5000 DEPOIS de salvar a posição
+    hrp.Anchored = true
+    hrp.CFrame   = CFrame.new(0, 5000, 0)
+
+    -- Cria ghostPart na posição ORIGINAL do player
+    if ghostPart then ghostPart:Destroy() end
+    ghostPart               = Instance.new("Part")
+    ghostPart.Name          = "CandyGhost"
+    ghostPart.Size          = Vector3.new(2, 5, 1)
+    ghostPart.Transparency  = 1
+    ghostPart.CanCollide    = true
+    ghostPart.Anchored      = false
+    ghostPart.CastShadow    = false
+    ghostPart.CFrame        = CFrame.new(originalPosition)  -- FIX: posição correta
+    ghostPart.Parent        = workspace
+
+    -- BodyVelocity para movimento horizontal
+    local bv        = Instance.new("BodyVelocity")
+    bv.Velocity     = Vector3.zero
+    bv.MaxForce     = Vector3.new(1e5, 0, 1e5)
+    bv.Parent       = ghostPart
+
+    -- BodyGyro para não tombar
+    local bg        = Instance.new("BodyGyro")
+    bg.MaxTorque    = Vector3.new(0, 1e5, 0)
+    bg.P            = 1e4
+    bg.CFrame       = ghostPart.CFrame
+    bg.Parent       = ghostPart
+
+    -- Câmera segue o ghostPart em terceira pessoa
+    camera.CameraType    = Enum.CameraType.Custom
+    camera.CameraSubject = ghostPart
+
+    if Connections.ghost then Connections.ghost:Disconnect() end
+
+    local SPEED = 16
+    Connections.ghost = RunService.Heartbeat:Connect(function()
+        if not State.invis or not ghostPart then return end
+
+        local hum2 = getHumanoid()
+        local bvObj = ghostPart:FindFirstChildOfClass("BodyVelocity")
+        if not bvObj then return end
+
+        -- FIX: MoveDirection já é relativo ao mundo — sem dupla transformação
+        local vel = Vector3.zero
+        if hum2 and hum2.MoveDirection.Magnitude > 0 then
+            vel = hum2.MoveDirection * SPEED
+        end
+        bvObj.Velocity = vel
+
+        -- Mantém HRP ancorado
+        local h = getHRP()
+        if h then
+            h.CFrame = CFrame.new(0, 5000, 0)
+            h.AssemblyLinearVelocity  = Vector3.zero
+            h.AssemblyAngularVelocity = Vector3.zero
+        end
+    end)
+end
+
+local function stopInvis()
+    State.invis = false
+
+    if Connections.ghost then
+        Connections.ghost:Disconnect()
+        Connections.ghost = nil
+    end
+
+    local char = player.Character
+    if char then
+        for _, p in ipairs(char:GetDescendants()) do
+            if p:IsA("BasePart") then
+                p.LocalTransparencyModifier = 0
+            end
+        end
+    end
+
+    local hrp = getHRP()
+    if hrp and ghostPart then
+        hrp.Anchored = false
+        hrp.CFrame   = CFrame.new(ghostPart.Position)
+        hrp.AssemblyLinearVelocity  = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+    elseif hrp then
+        hrp.Anchored = false
+    end
+
+    if ghostPart then
+        ghostPart:Destroy()
+        ghostPart = nil
+    end
+
+    -- FIX: restaura câmera com CameraSubject do Humanoid atual
+    camera.CameraType = Enum.CameraType.Custom
+    local hum = getHumanoid()
+    camera.CameraSubject = hum
+        or State.originalCamSubject
+end
+
+-- ═══════════════════════════════════════════
+-- SPEED BOOST
+-- FIX: lê WalkSpeed no momento de ativar (personagem atual)
+-- ═══════════════════════════════════════════
+local speedValue = 30
+
+local function applySpeed(value)
+    local hum = getHumanoid()
+    if hum then hum.WalkSpeed = value end
+end
+
+local function startSpeedBoost(value)
+    -- FIX: salva velocidade do personagem atual, não de um anterior
+    local hum = getHumanoid()
+    State.originalSpeed = hum and hum.WalkSpeed or 16
+    applySpeed(value)
+end
+
+local function stopSpeedBoost()
+    applySpeed(State.originalSpeed)
+    State.speedBoost = false
+end
+
+-- ═══════════════════════════════════════════
+-- PUMPKIN EVENT
+-- ═══════════════════════════════════════════
+local function findPumpkinCarrier()
+    for _, p in ipairs(Players:GetPlayers()) do
+        local char = p.Character
+        if char then
+            local acc = char:FindFirstChild("Pumpkin")
+            if acc and acc:IsA("Accessory") then
+                return p, char
+            end
+        end
+    end
+    return nil, nil
+end
+
+-- ═══════════════════════════════════════════
+-- TELEPORT TO TOWER
+-- ═══════════════════════════════════════════
+local function doTeleport()
+    local hrp = getHRP()
+    if not hrp then return end
+    hrp.Anchored = true
+    hrp.CFrame   = CFrame.new(TowerPosition + Vector3.new(0, 5, 0))
+    task.delay(1, function()
+        local h = getHRP()
+        if h then
+            h.Anchored = false
+            h.AssemblyLinearVelocity  = Vector3.zero
+            h.AssemblyAngularVelocity = Vector3.zero
+        end
+    end)
+end
+
+-- ═══════════════════════════════════════════
+-- GUI
+-- ═══════════════════════════════════════════
+if player:WaitForChild("PlayerGui"):FindFirstChild("CandyCollectorV1") then
+    player.PlayerGui.CandyCollectorV1:Destroy()
+end
+
+local gui = Instance.new("ScreenGui")
+gui.Name         = "CandyCollectorV1"
+gui.ResetOnSpawn = false
+gui.DisplayOrder = 999
+gui.Parent       = player:WaitForChild("PlayerGui")
+
+local PANEL_W    = 300
+local PANEL_H    = 340
+local PANEL_SIZE = UDim2.fromOffset(PANEL_W, PANEL_H)
+local MINI_SIZE  = UDim2.fromOffset(PANEL_W, 48)
+
+local panel = Instance.new("Frame")
+panel.Name                   = "Panel"
+panel.Size                   = UDim2.fromOffset(0, 0)
+panel.Position               = UDim2.new(0.5, -150, 0.5, -170)
+panel.BackgroundColor3       = Color3.fromRGB(25, 18, 35)
+panel.BackgroundTransparency = 1
+panel.BorderSizePixel        = 0
+panel.ClipsDescendants       = true
+panel.ZIndex                 = 2
+panel.Parent                 = gui
+
+Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 12)
+
+local gradient = Instance.new("UIGradient")
+gradient.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0,   Color3.fromRGB(255, 120, 35)),
+    ColorSequenceKeypoint.new(0.5, Color3.fromRGB(130, 55, 125)),
+    ColorSequenceKeypoint.new(1,   Color3.fromRGB(65,  30, 100)),
+})
+gradient.Rotation = 35
+gradient.Parent   = panel
+
+local studsTexture = Instance.new("ImageLabel")
+studsTexture.Size               = UDim2.new(1, 0, 1, 0)
+studsTexture.BackgroundTransparency = 1
+studsTexture.Image              = STUDS_ID
+studsTexture.ScaleType          = Enum.ScaleType.Tile
+studsTexture.TileSize           = UDim2.fromOffset(40, 40)
+studsTexture.ImageTransparency  = 0.88
+studsTexture.ZIndex             = 2
+studsTexture.Parent             = panel
+
+local border = Instance.new("UIStroke")
+border.Thickness    = 1
+border.Color        = Color3.fromRGB(224, 155, 75)
+border.Transparency = 0.12
+border.Parent       = panel
+
+-- ─── HEADER ────────────────────────────────
+local header = Instance.new("Frame")
+header.Name                   = "Header"
+header.Size                   = UDim2.new(1, 0, 0, 46)
+header.BackgroundTransparency = 1
+header.ZIndex                 = 4
+header.Parent                 = panel
+
+local avatar = Instance.new("ImageLabel")
+avatar.Size                   = UDim2.fromOffset(32, 32)
+avatar.Position               = UDim2.fromOffset(10, 7)
+avatar.BackgroundColor3       = Color3.fromRGB(65, 35, 85)
+avatar.BackgroundTransparency = 0.1
+avatar.ZIndex                 = 5
+avatar.Parent                 = header
+Instance.new("UICorner", avatar).CornerRadius = UDim.new(1, 0)
+local avStroke = Instance.new("UIStroke")
+avStroke.Color     = Color3.fromRGB(255, 160, 60)
+avStroke.Thickness = 1
+avStroke.Parent    = avatar
+
+task.spawn(function()
+    local ok, img = pcall(function()
+        return Players:GetUserThumbnailAsync(
+            player.UserId,
+            Enum.ThumbnailType.HeadShot,
+            Enum.ThumbnailSize.Size100x100
+        )
+    end)
+    if ok and avatar.Parent then avatar.Image = img end
+end)
+
+local titleLabel = Instance.new("TextLabel")
+titleLabel.Size               = UDim2.new(1, -115, 1, 0)
+titleLabel.Position           = UDim2.fromOffset(48, 0)
+titleLabel.BackgroundTransparency = 1
+titleLabel.Text               = "CANDY COLLECTOR V1"
+titleLabel.TextColor3         = Color3.fromRGB(255, 240, 220)
+titleLabel.TextSize           = 14
+titleLabel.FontFace           = FONT
+titleLabel.TextXAlignment     = Enum.TextXAlignment.Left
+titleLabel.ZIndex             = 5
+titleLabel.Parent             = header
+
+local closeBtn = Instance.new("TextButton")
+closeBtn.Size             = UDim2.fromOffset(26, 26)
+closeBtn.Position         = UDim2.new(1, -32, 0.5, -13)
+closeBtn.Text             = "X"
+closeBtn.TextSize         = 14
+closeBtn.FontFace         = FONT
+closeBtn.TextColor3       = Color3.new(1,1,1)
+closeBtn.BackgroundColor3 = Color3.fromRGB(110, 40, 55)
+closeBtn.ZIndex           = 5
+closeBtn.Parent           = header
+Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 6)
+
+local minBtn = Instance.new("TextButton")
+minBtn.Size             = UDim2.fromOffset(26, 26)
+minBtn.Position         = UDim2.new(1, -62, 0.5, -13)
+minBtn.Text             = "−"
+minBtn.TextSize         = 18
+minBtn.FontFace         = FONT
+minBtn.TextColor3       = Color3.new(1,1,1)
+minBtn.BackgroundColor3 = Color3.fromRGB(75, 45, 105)
+minBtn.ZIndex           = 5
+minBtn.Parent           = header
+Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 6)
+
+local headerSep = Instance.new("Frame")
+headerSep.Size             = UDim2.new(1, -20, 0, 1)
+headerSep.Position         = UDim2.fromOffset(10, 44)
+headerSep.BackgroundColor3 = Color3.fromRGB(200, 140, 80)
+headerSep.BackgroundTransparency = 0.5
+headerSep.BorderSizePixel  = 0
+headerSep.ZIndex           = 4
+headerSep.Parent           = panel
+
+-- ─── SCROLL ────────────────────────────────
+local scrollFrame = Instance.new("ScrollingFrame")
+scrollFrame.Name                = "ScrollContent"
+scrollFrame.Size                = UDim2.new(1, 0, 1, -48)
+scrollFrame.Position            = UDim2.fromOffset(0, 47)
+scrollFrame.BackgroundTransparency = 1
+scrollFrame.BorderSizePixel     = 0
+scrollFrame.ScrollBarThickness  = 3
+scrollFrame.ScrollBarImageColor3 = Color3.fromRGB(180, 80, 255)
+scrollFrame.CanvasSize          = UDim2.new(0, 0, 0, 0)
+scrollFrame.ZIndex              = 3
+scrollFrame.ClipsDescendants    = true
+scrollFrame.Parent              = panel
+
+local scrollLayout = Instance.new("UIListLayout")
+scrollLayout.Padding   = UDim.new(0, 6)
+scrollLayout.SortOrder = Enum.SortOrder.LayoutOrder
+scrollLayout.Parent    = scrollFrame
+
+local scrollPad = Instance.new("UIPadding")
+scrollPad.PaddingTop    = UDim.new(0, 8)
+scrollPad.PaddingBottom = UDim.new(0, 8)
+scrollPad.PaddingLeft   = UDim.new(0, 10)
+scrollPad.PaddingRight  = UDim.new(0, 10)
+scrollPad.Parent        = scrollFrame
+
+scrollLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+    scrollFrame.CanvasSize = UDim2.new(0, 0, 0,
+        scrollLayout.AbsoluteContentSize.Y + 16
+    )
+end)
+
+-- ═══════════════════════════════════════════
+-- HELPERS DE UI
+-- ═══════════════════════════════════════════
+local function makeSectionLabel(text, order)
+    local lbl = Instance.new("TextLabel")
+    lbl.Size               = UDim2.new(1, 0, 0, 18)
+    lbl.BackgroundTransparency = 1
+    lbl.Text               = text
+    lbl.TextColor3         = Color3.fromRGB(255, 190, 80)
+    lbl.TextSize           = 11
+    lbl.FontFace           = FONT
+    lbl.TextXAlignment     = Enum.TextXAlignment.Left
+    lbl.LayoutOrder        = order
+    lbl.ZIndex             = 4
+    lbl.Parent             = scrollFrame
+end
+
+local function makeSep(order)
+    local f = Instance.new("Frame")
+    f.Size             = UDim2.new(1, 0, 0, 1)
+    f.BackgroundColor3 = Color3.fromRGB(180, 120, 60)
+    f.BackgroundTransparency = 0.6
+    f.BorderSizePixel  = 0
+    f.LayoutOrder      = order
+    f.ZIndex           = 4
+    f.Parent           = scrollFrame
+end
+
+local function makeBtn(text, order, h)
+    h = h or 34
+    local btn = Instance.new("TextButton")
+    btn.Size             = UDim2.new(1, 0, 0, h)
+    btn.BackgroundColor3 = Color3.fromRGB(30, 18, 48)
+    btn.Text             = text
+    btn.TextColor3       = Color3.fromRGB(240, 230, 215)
+    btn.TextSize         = 13
+    btn.FontFace         = FONT
+    btn.AutoButtonColor  = false
+    btn.LayoutOrder      = order
+    btn.ZIndex           = 4
+    btn.Parent           = scrollFrame
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 8)
+
+    local g = Instance.new("UIGradient")
+    g.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(70, 40, 110)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(35, 18, 60)),
+    })
+    g.Rotation = 90
+    g.Parent   = btn
+
+    local s = Instance.new("UIStroke")
+    s.Thickness    = 1
+    s.Color        = Color3.fromRGB(20, 12, 35)
+    s.Transparency = 0
+    s.Parent       = btn
+
+    btn.MouseButton1Down:Connect(function()
+        TweenService:Create(btn, TweenInfo.new(0.08), {
+            BackgroundColor3 = Color3.fromRGB(90, 50, 140),
+        }):Play()
+    end)
+    btn.MouseButton1Up:Connect(function()
+        TweenService:Create(btn, TweenInfo.new(0.12), {
+            BackgroundColor3 = Color3.fromRGB(30, 18, 48),
+        }):Play()
+    end)
+
+    return btn
+end
+
+local function makeSwitch(labelText, order, onEnable, onDisable)
+    local row = Instance.new("Frame")
+    row.Size             = UDim2.new(1, 0, 0, 34)
+    row.BackgroundColor3 = Color3.fromRGB(30, 18, 48)
+    row.BorderSizePixel  = 0
+    row.LayoutOrder      = order
+    row.ZIndex           = 4
+    row.Parent           = scrollFrame
+    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 8)
+
+    local rStroke = Instance.new("UIStroke")
+    rStroke.Color       = Color3.fromRGB(20, 12, 35)
+    rStroke.Thickness   = 1
+    rStroke.Parent      = row
+
+    local rGrad = Instance.new("UIGradient")
+    rGrad.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(70, 40, 110)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(35, 18, 60)),
+    })
+    rGrad.Rotation = 90
+    rGrad.Parent   = row
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size               = UDim2.new(1, -70, 1, 0)
+    lbl.Position           = UDim2.fromOffset(10, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Text               = labelText
+    lbl.TextColor3         = Color3.fromRGB(240, 230, 215)
+    lbl.TextSize           = 13
+    lbl.FontFace           = FONT
+    lbl.TextXAlignment     = Enum.TextXAlignment.Left
+    lbl.ZIndex             = 5
+    lbl.Parent             = row
+
+    local track = Instance.new("TextButton")
+    track.Size             = UDim2.fromOffset(48, 24)
+    track.Position         = UDim2.new(1, -56, 0.5, -12)
+    track.BackgroundColor3 = Color3.fromRGB(50, 40, 60)
+    track.Text             = ""
+    track.AutoButtonColor  = false
+    track.ZIndex           = 5
+    track.Parent           = row
+    Instance.new("UICorner", track).CornerRadius = UDim.new(1, 0)
+
+    local tStroke = Instance.new("UIStroke")
+    tStroke.Color       = Color3.fromRGB(20, 12, 35)
+    tStroke.Thickness   = 1
+    tStroke.Parent      = track
+
+    local knob = Instance.new("Frame")
+    knob.Size             = UDim2.fromOffset(18, 18)
+    knob.Position         = UDim2.fromOffset(3, 3)
+    knob.BackgroundColor3 = Color3.fromRGB(200, 190, 210)
+    knob.ZIndex           = 6
+    knob.Parent           = track
+    Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
+
+    local enabled = false
+    track.Activated:Connect(function()
+        playClick()
+        enabled = not enabled
+        TweenService:Create(track, TweenInfo.new(0.15, Enum.EasingStyle.Cubic), {
+            BackgroundColor3 = enabled
+                and Color3.fromRGB(160, 70, 220)
+                or  Color3.fromRGB(50, 40, 60),
+        }):Play()
+        TweenService:Create(knob, TweenInfo.new(0.15, Enum.EasingStyle.Cubic), {
+            Position = enabled
+                and UDim2.new(1, -21, 0, 3)
+                or  UDim2.fromOffset(3, 3),
+        }):Play()
+        if enabled then onEnable() else onDisable() end
+    end)
+
+    return row
+end
+
+-- FIX: slider com suporte a arraste iniciado na track (mobile)
+local function makeSlider(labelPrefix, order, minVal, maxVal, defaultVal, onChange)
+    local container = Instance.new("Frame")
+    container.Size             = UDim2.new(1, 0, 0, 48)
+    container.BackgroundTransparency = 1
+    container.LayoutOrder      = order
+    container.ZIndex           = 4
+    container.Parent           = scrollFrame
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size               = UDim2.new(1, 0, 0, 18)
+    lbl.BackgroundTransparency = 1
+    lbl.Text               = string.format("%s%.1f", labelPrefix, defaultVal)
+    lbl.TextColor3         = Color3.fromRGB(220, 200, 255)
+    lbl.TextSize           = 11
+    lbl.FontFace           = FONT
+    lbl.TextXAlignment     = Enum.TextXAlignment.Left
+    lbl.ZIndex             = 5
+    lbl.Parent             = container
+
+    local track = Instance.new("Frame")
+    track.Size             = UDim2.new(1, 0, 0, 8)
+    track.Position         = UDim2.fromOffset(0, 24)
+    track.BackgroundColor3 = Color3.fromRGB(40, 28, 58)
+    track.BorderSizePixel  = 0
+    track.ZIndex           = 5
+    track.Parent           = container
+    Instance.new("UICorner", track).CornerRadius = UDim.new(1, 0)
+
+    local tStroke = Instance.new("UIStroke")
+    tStroke.Color       = Color3.fromRGB(20, 12, 35)
+    tStroke.Thickness   = 1
+    tStroke.Parent      = track
+
+    local defaultRel = (defaultVal - minVal) / (maxVal - minVal)
+
+    local fill = Instance.new("Frame")
+    fill.Size             = UDim2.new(defaultRel, 0, 1, 0)
+    fill.BackgroundColor3 = Color3.fromRGB(160, 70, 220)
+    fill.BorderSizePixel  = 0
+    fill.ZIndex           = 6
+    fill.Parent           = track
+    Instance.new("UICorner", fill).CornerRadius = UDim.new(1, 0)
+
+    local knob = Instance.new("TextButton")
+    knob.Size             = UDim2.fromOffset(16, 16)
+    knob.AnchorPoint      = Vector2.new(0.5, 0.5)
+    knob.Position         = UDim2.new(defaultRel, 0, 0.5, 0)
+    knob.BackgroundColor3 = Color3.fromRGB(210, 170, 255)
+    knob.Text             = ""
+    knob.ZIndex           = 7
+    knob.Parent           = track
+    Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
+
+    local kStroke = Instance.new("UIStroke")
+    kStroke.Color       = Color3.fromRGB(20, 12, 35)
+    kStroke.Thickness   = 1
+    kStroke.Parent      = knob
+
+    local sliding = false
+
+    local function update(inputX)
+        local abs  = track.AbsolutePosition
+        local size = track.AbsoluteSize
+        if size.X == 0 then return end
+        local rel  = math.clamp((inputX - abs.X) / size.X, 0, 1)
+        fill.Size     = UDim2.new(rel, 0, 1, 0)
+        knob.Position = UDim2.new(rel, 0, 0.5, 0)
+        local val     = minVal + rel * (maxVal - minVal)
+        lbl.Text      = string.format("%s%.1f", labelPrefix, val)
+        onChange(val)
+    end
+
+    -- FIX: arraste iniciado tanto no knob quanto na track
+    local function onInputBegan(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            sliding = true
+            update(input.Position.X)
+        end
+    end
+
+    knob.InputBegan:Connect(onInputBegan)
+    track.InputBegan:Connect(onInputBegan)
+
+    -- FIX: conexões globais registradas para limpeza ao fechar
+    local c1 = UserInputService.InputChanged:Connect(function(i)
+        if sliding and (
+            i.UserInputType == Enum.UserInputType.MouseMovement or
+            i.UserInputType == Enum.UserInputType.Touch
+        ) then update(i.Position.X) end
+    end)
+    local c2 = UserInputService.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+            or i.UserInputType == Enum.UserInputType.Touch then
+            sliding = false
+        end
+    end)
+
+    table.insert(GlobalConnections, c1)
+    table.insert(GlobalConnections, c2)
+
+    return container
+end
+
+-- ═══════════════════════════════════════════
+-- LAYOUT
+-- ═══════════════════════════════════════════
+local ord = 1
+
+-- CANDY
+makeSectionLabel("🍬  AUTO CANDY", ord) ord = ord + 1
+makeSwitch("Auto Candy", ord,
+    function() State.autoCandy = true  startAutoCandy()  end,
+    function() stopAutoCandy() end
+) ord = ord + 1
+makeSlider("Velocidade: ", ord, 0.1, 2.0, 0.8, function(v)
+    State.tweenSpeed = v
+end) ord = ord + 1
+makeSep(ord) ord = ord + 1
+
+-- AUTO DOORS
+makeSectionLabel("🚪  AUTO DOORS", ord) ord = ord + 1
+makeSwitch("Door Invisibility", ord,
+    function() State.invis = true  startInvis()  end,
+    function() stopInvis() end
+) ord = ord + 1
+makeSwitch("Instant Door", ord,
+    function()
+        State.instantDoor = true
+        applyInstantDoor()
+        startInstantDoorWatcher()
+    end,
+    function()
+        State.instantDoor = false
+        removeInstantDoor()
+        stopInstantDoorWatcher()
+    end
+) ord = ord + 1
+
+-- TP Door + lista
+local tpDoorBtn = makeBtn("🚪  TP Door", ord, 34) ord = ord + 1
+
+local doorListFrame = Instance.new("ScrollingFrame")
+doorListFrame.Name                = "DoorList"
+doorListFrame.Size                = UDim2.new(1, 0, 0, 0)
+doorListFrame.BackgroundColor3    = Color3.fromRGB(20, 12, 32)
+doorListFrame.BackgroundTransparency = 0.05
+doorListFrame.BorderSizePixel     = 0
+doorListFrame.ScrollBarThickness  = 3
+doorListFrame.ScrollBarImageColor3 = Color3.fromRGB(160, 70, 220)
+doorListFrame.CanvasSize          = UDim2.new(0, 0, 0, 0)
+doorListFrame.Visible             = false
+doorListFrame.LayoutOrder         = ord
+doorListFrame.ZIndex              = 4
+doorListFrame.ClipsDescendants    = true
+doorListFrame.Parent              = scrollFrame
+Instance.new("UICorner", doorListFrame).CornerRadius = UDim.new(0, 8)
+local dlStroke = Instance.new("UIStroke")
+dlStroke.Color    = Color3.fromRGB(20, 12, 35)
+dlStroke.Thickness = 1
+dlStroke.Parent   = doorListFrame
+local dlLayout = Instance.new("UIListLayout")
+dlLayout.Padding = UDim.new(0, 3)
+dlLayout.Parent  = doorListFrame
+local dlPad = Instance.new("UIPadding")
+dlPad.PaddingTop    = UDim.new(0, 5)
+dlPad.PaddingBottom = UDim.new(0, 5)
+dlPad.PaddingLeft   = UDim.new(0, 5)
+dlPad.PaddingRight  = UDim.new(0, 5)
+dlPad.Parent        = doorListFrame
+ord = ord + 1
+
+local doorListOpen = false
+
+local function buildAndShowDoorList()
+    for _, ch in ipairs(doorListFrame:GetChildren()) do
+        if ch:IsA("TextButton") or ch:IsA("TextLabel") then
+            ch:Destroy()
+        end
+    end
+
+    local doors = getDoorPrompts()
+
+    if #doors == 0 then
+        local empty = Instance.new("TextLabel")
+        empty.Size               = UDim2.new(1, 0, 0, 28)
+        empty.BackgroundTransparency = 1
+        empty.Text               = "Nenhuma porta ativa no momento"
+        empty.TextColor3         = Color3.fromRGB(200, 160, 255)
+        empty.TextSize           = 11
+        empty.FontFace           = FONT
+        empty.ZIndex             = 5
+        empty.Parent             = doorListFrame
+    else
+        for i, d in ipairs(doors) do
+            local item = Instance.new("TextButton")
+            item.Size             = UDim2.new(1, 0, 0, 30)
+            item.BackgroundColor3 = Color3.fromRGB(40, 22, 65)
+            item.Text             = string.format("Porta %d", i)
+            item.TextColor3       = Color3.fromRGB(240, 225, 210)
+            item.TextSize         = 12
+            item.FontFace         = FONT
+            item.AutoButtonColor  = false
+            item.ZIndex           = 5
+            item.Parent           = doorListFrame
+            Instance.new("UICorner", item).CornerRadius = UDim.new(0, 6)
+
+            local iStroke = Instance.new("UIStroke")
+            iStroke.Color     = Color3.fromRGB(20, 12, 35)
+            iStroke.Thickness = 1
+            iStroke.Parent    = item
+
+            local iGrad = Instance.new("UIGradient")
+            iGrad.Color = ColorSequence.new({
+                ColorSequenceKeypoint.new(0, Color3.fromRGB(65, 38, 100)),
+                ColorSequenceKeypoint.new(1, Color3.fromRGB(35, 18, 58)),
+            })
+            iGrad.Rotation = 90
+            iGrad.Parent   = item
+
+            item.MouseButton1Down:Connect(function()
+                TweenService:Create(item, TweenInfo.new(0.08), {
+                    BackgroundColor3 = Color3.fromRGB(90, 50, 140),
+                }):Play()
+            end)
+            item.MouseButton1Up:Connect(function()
+                TweenService:Create(item, TweenInfo.new(0.1), {
+                    BackgroundColor3 = Color3.fromRGB(40, 22, 65),
+                }):Play()
+            end)
+
+            item.Activated:Connect(function()
+                playClick()
+                -- FIX: valida referência antes de usar
+                if not d.part.Parent or not d.prompt.Parent then
+                    item.Text      = "Porta removida"
+                    item.TextColor3 = Color3.fromRGB(200, 100, 100)
+                    return
+                end
+                local hrp = getHRP()
+                if hrp then
+                    hrp.Anchored = true
+                    hrp.CFrame   = CFrame.new(
+                        d.part.Position + Vector3.new(0, 4, 0)
+                    )
+                    task.delay(1, function()
+                        local h = getHRP()
+                        if h then
+                            h.Anchored = false
+                            h.AssemblyLinearVelocity  = Vector3.zero
+                            h.AssemblyAngularVelocity = Vector3.zero
+                        end
+                    end)
+                    firePromptSafe(d.prompt)
+                end
+
+                doorListOpen = false
+                TweenService:Create(doorListFrame,
+                    TweenInfo.new(0.2, Enum.EasingStyle.Cubic), {
+                    Size = UDim2.new(1, 0, 0, 0),
+                }):Play()
+                task.delay(0.2, function()
+                    doorListFrame.Visible = false
+                end)
+            end)
+        end
+    end
+
+    -- FIX: aguarda layout atualizar antes de calcular altura
+    task.wait()
+    doorListFrame.CanvasSize = UDim2.new(0, 0, 0,
+        dlLayout.AbsoluteContentSize.Y + 10
+    )
+    local targetH = math.min(dlLayout.AbsoluteContentSize.Y + 10, 150)
+    doorListFrame.Visible = true
+    doorListFrame.Size    = UDim2.new(1, 0, 0, 0)
+    TweenService:Create(doorListFrame,
+        TweenInfo.new(0.25, Enum.EasingStyle.Cubic, Enum.EasingDirection.Out), {
+        Size = UDim2.new(1, 0, 0, targetH),
+    }):Play()
+end
+
+tpDoorBtn.Activated:Connect(function()
+    playClick()
+    doorListOpen = not doorListOpen
+    if doorListOpen then
+        buildAndShowDoorList()
+    else
+        TweenService:Create(doorListFrame,
+            TweenInfo.new(0.2, Enum.EasingStyle.Cubic), {
+            Size = UDim2.new(1, 0, 0, 0),
+        }):Play()
+        task.delay(0.2, function()
+            doorListFrame.Visible = false
+        end)
+    end
+end)
+
+local fireDoorBtn = makeBtn("⚡  Fire Door PP", ord, 34) ord = ord + 1
+fireDoorBtn.Activated:Connect(function()
+    playClick()
+    for _, d in ipairs(getDoorPrompts()) do
+        firePromptSafe(d.prompt)
+    end
+end)
+makeSep(ord) ord = ord + 1
+
+-- PROMPTS
+makeSectionLabel("⚡  PROMPTS", ord) ord = ord + 1
+local firePPBtn = makeBtn("⚡  Fire PP (todos)", ord, 34) ord = ord + 1
+firePPBtn.Activated:Connect(function()
+    playClick()
+    fireAllPP()
+end)
+
+local autoPromptActive = false
+local autoPromptBtn    = makeBtn("🔁  Auto Prompt: OFF", ord, 34) ord = ord + 1
+autoPromptBtn.Activated:Connect(function()
+    playClick()
+    autoPromptActive  = not autoPromptActive
+    State.autoPrompt  = autoPromptActive
+    autoPromptBtn.Text = autoPromptActive
+        and "🔁  Auto Prompt: ON"
+        or  "🔁  Auto Prompt: OFF"
+    TweenService:Create(autoPromptBtn, TweenInfo.new(0.15), {
+        BackgroundColor3 = autoPromptActive
+            and Color3.fromRGB(100, 40, 160)
+            or  Color3.fromRGB(30, 18, 48),
+    }):Play()
+    if autoPromptActive then startAutoPrompt() else stopAutoPrompt() end
+end)
+makeSep(ord) ord = ord + 1
+
+-- SPEED BOOST
+makeSectionLabel("💨  SPEED BOOST", ord) ord = ord + 1
+makeSwitch("Speed Boost", ord,
+    function()
+        State.speedBoost = true
+        startSpeedBoost(speedValue)
+    end,
+    function() stopSpeedBoost() end
+) ord = ord + 1
+makeSlider("Speed: ", ord, 16, 100, 30, function(v)
+    speedValue = v
+    if State.speedBoost then applySpeed(v) end
+end) ord = ord + 1
+makeSep(ord) ord = ord + 1
+
+-- PUMPKIN EVENT
+makeSectionLabel("🎃  PUMPKIN EVENT", ord) ord = ord + 1
+local pumpkinBtn = makeBtn("🎃  Ir ao Portador", ord, 34) ord = ord + 1
+pumpkinBtn.Activated:Connect(function()
+    playClick()
+    local carrier, _ = findPumpkinCarrier()
+    if carrier then
+        local hrp   = getHRP()
+        local charC = carrier.Character
+        local tHRP  = charC and charC:FindFirstChild("HumanoidRootPart")
+        if hrp and tHRP then
+            hrp.Anchored = true
+            hrp.CFrame   = CFrame.new(tHRP.Position + Vector3.new(0, 3, 0))
+            task.delay(1, function()
+                local h = getHRP()
+                if h then
+                    h.Anchored = false
+                    h.AssemblyLinearVelocity  = Vector3.zero
+                    h.AssemblyAngularVelocity = Vector3.zero
+                end
+            end)
+        end
+    end
+end)
+makeSep(ord) ord = ord + 1
+
+-- TELEPORTE
+makeSectionLabel("🏯  TELEPORTE", ord) ord = ord + 1
+local tpTowerBtn = makeBtn("🏯  Teleport to Tower", ord, 34) ord = ord + 1
+tpTowerBtn.Activated:Connect(function()
+    playClick()
+    doTeleport()
+end)
+
+-- ═══════════════════════════════════════════
+-- MINIMIZAR
+-- ═══════════════════════════════════════════
+local EASING_IN     = TweenInfo.new(0.45, Enum.EasingStyle.Cubic, Enum.EasingDirection.Out)
+local EASING_RESIZE = TweenInfo.new(0.3,  Enum.EasingStyle.Cubic, Enum.EasingDirection.Out)
+local minimized     = false
+
+minBtn.Activated:Connect(function()
+    playClick()
+    minimized    = not minimized
+    minBtn.Text  = minimized and "+" or "−"
+    TweenService:Create(panel, EASING_RESIZE, {
+        Size = minimized and MINI_SIZE or PANEL_SIZE,
+    }):Play()
+    scrollFrame.Visible = not minimized
+    headerSep.Visible   = not minimized
+end)
+
+-- ═══════════════════════════════════════════
+-- FECHAR — FIX: limpa conexões globais
+-- ═══════════════════════════════════════════
+closeBtn.Activated:Connect(function()
+    playClick()
+    stopAutoCandy()
+    stopAutoPrompt()
+    if State.invis        then stopInvis()         end
+    if State.instantDoor  then
+        removeInstantDoor()
+        stopInstantDoorWatcher()
+    end
+    if State.speedBoost   then stopSpeedBoost()    end
+
+    -- FIX: desconecta todas as conexões globais dos sliders
+    for _, conn in ipairs(GlobalConnections) do
+        conn:Disconnect()
+    end
+    GlobalConnections = {}
+
+    TweenService:Create(panel, TweenInfo.new(0.2, Enum.EasingStyle.Cubic), {
+        BackgroundTransparency = 1,
+        Size                   = UDim2.fromOffset(0, 0),
+    }):Play()
+    task.delay(0.25, function() gui:Destroy() end)
+end)
+
+-- ═══════════════════════════════════════════
+-- ARRASTAR — FIX: ignora input que começa nos botões do header
+-- ═══════════════════════════════════════════
+local dragging    = false
+local dragStart   = nil
+local startPos    = nil
+local activeInput = nil
+
+header.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        -- FIX: não inicia arraste se o toque foi nos botões
+        local pos = input.Position
+        local function isInsideBtn(btn)
+            local ap = btn.AbsolutePosition
+            local as = btn.AbsoluteSize
+            return pos.X >= ap.X and pos.X <= ap.X + as.X
+               and pos.Y >= ap.Y and pos.Y <= ap.Y + as.Y
+        end
+        if isInsideBtn(closeBtn) or isInsideBtn(minBtn) then return end
+
+        dragging  = true
+        dragStart = input.Position
+        startPos  = panel.Position
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                dragging = false
+            end
+        end)
+    end
+end)
+
+header.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch then
+        activeInput = input
+    end
+end)
+
+local dragConn = UserInputService.InputChanged:Connect(function(input)
+    if dragging and input == activeInput then
+        local delta = input.Position - dragStart
+        panel.Position = UDim2.new(
+            startPos.X.Scale,
+            startPos.X.Offset + delta.X,
+            startPos.Y.Scale,
+            startPos.Y.Offset + delta.Y
+        )
+    end
+end)
+table.insert(GlobalConnections, dragConn)
+
+-- ═══════════════════════════════════════════
+-- RECONECTA AO RESPAWN
+-- FIX: restaura câmera e velocidade com personagem atual
+-- ═══════════════════════════════════════════
+player.CharacterAdded:Connect(function(char)
+    -- Limpa invisibilidade
+    if State.invis then
+        State.invis = false
+        if Connections.ghost then
+            Connections.ghost:Disconnect()
+            Connections.ghost = nil
+        end
+        if ghostPart then
+            ghostPart:Destroy()
+            ghostPart = nil
+        end
+    end
+
+    -- FIX: aguarda Humanoid do novo personagem
+    local hum = char:WaitForChild("Humanoid", 5)
+    camera.CameraType    = Enum.CameraType.Custom
+    camera.CameraSubject = hum or char:FindFirstChildOfClass("Humanoid")
+
+    if State.speedBoost then
+        task.wait(1)
+        applySpeed(speedValue)
+    end
+    if LoopFlags.autoCandy then
+        LoopFlags.autoCandy = false  -- para loop anterior
+        task.wait(2)
+        State.autoCandy     = true
+        startAutoCandy()
+    end
+    if LoopFlags.autoPrompt then
+        LoopFlags.autoPrompt = false
+        task.wait(2)
+        State.autoPrompt     = true
+        startAutoPrompt()
+    end
+end)
+
+-- ═══════════════════════════════════════════
+-- ENTRADA
+-- ═══════════════════════════════════════════
+local function playEntrance()
+    panel.Size                   = UDim2.fromOffset(0, 0)
+    panel.BackgroundTransparency = 1
+    TweenService:Create(panel, EASING_IN, {
+        Size                   = PANEL_SIZE,
+        BackgroundTransparency = 0.1,
+    }):Play()
+end
+
+playEntrance()
