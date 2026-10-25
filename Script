@@ -1,7 +1,8 @@
 -- CANDY COLLECTOR V1
 -- Jujutsu Shenanigans | Arceus X | Android
--- Correções: ghostPart position, loop lifecycle, câmera respawn,
---            slider mobile, conexões globais, detecção de portas
+-- Correções: Door Invisibility simplificada, Part ESP nas portas,
+-- HoldDuration=0 confirmado, coleta por desaparecimento da Part,
+-- loop lifecycle, câmera respawn, slider mobile, conexões globais
 
 local Players          = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
@@ -29,7 +30,7 @@ local TowerPosition = Vector3.new(
 )
 
 -- ═══════════════════════════════════════════
--- SOM — clone por clique, sem cortar som anterior
+-- SOM — clone por clique
 -- ═══════════════════════════════════════════
 local clickTemplate   = Instance.new("Sound")
 clickTemplate.SoundId = CLICK_ID
@@ -44,35 +45,39 @@ local function playClick()
 end
 
 -- ═══════════════════════════════════════════
--- ESTADO GLOBAL
+-- ESTADO
 -- ═══════════════════════════════════════════
 local State = {
-    autoCandy      = false,
-    autoPrompt     = false,
-    invis          = false,
-    instantDoor    = false,
-    speedBoost     = false,
-    tweenSpeed     = 0.8,
-    originalSpeed  = 16,
+    autoCandy    = false,
+    autoPrompt   = false,
+    invis        = false,
+    instantDoor  = false,
+    speedBoost   = false,
+    doorESP      = false,
+    tweenSpeed   = 0.8,
+    originalSpeed = 16,
     originalCamSubject = nil,
 }
 
--- Controle de ciclo de vida dos loops
 local LoopFlags = {
-    autoCandy  = false,   -- flag que o loop lê pra saber se para
+    autoCandy  = false,
     autoPrompt = false,
 }
 
 local Connections = {
-    ghost        = nil,
     instantWatch = nil,
+    espWatch     = nil,
 }
 
--- Conexões globais criadas pelos sliders — limpas ao fechar
 local GlobalConnections = {}
+local activeCandyTween  = nil
+local speedValue        = 30
 
-local ghostPart         = nil
-local activeCandyTween  = nil   -- tween atual do Auto Candy
+-- ESP: tabela de Highlights criados
+local espHighlights = {}
+
+-- Instant Door: HoldDuration originais
+local instantDoorOriginals = {}
 
 -- ═══════════════════════════════════════════
 -- HELPERS
@@ -88,7 +93,7 @@ local function getHumanoid()
 end
 
 -- ═══════════════════════════════════════════
--- ANTI-AFK — protegido por pcall
+-- ANTI-AFK
 -- ═══════════════════════════════════════════
 player.Idled:Connect(function()
     pcall(function()
@@ -99,15 +104,14 @@ end)
 
 -- ═══════════════════════════════════════════
 -- DETECÇÃO DE PORTAS
--- Busca Part "door" com ProximityPrompt filho direto
--- Valida se a referência ainda existe antes de retornar
+-- Part "door" com ProximityPrompt filho direto
 -- ═══════════════════════════════════════════
 local function getDoorPrompts()
     local result = {}
     for _, obj in ipairs(workspace:GetDescendants()) do
         if obj.Name == "door"
             and obj:IsA("BasePart")
-            and obj.Parent  -- ainda existe no Workspace
+            and obj.Parent
         then
             local prompt = obj:FindFirstChildOfClass("ProximityPrompt")
             if prompt then
@@ -130,13 +134,59 @@ local function firePromptSafe(prompt)
 end
 
 -- ═══════════════════════════════════════════
--- INSTANT DOOR
+-- PART ESP
+-- Highlight nas Parts "door" enquanto ESP ativo
+-- Monitora novas portas adicionadas dinamicamente
 -- ═══════════════════════════════════════════
-local instantDoorOriginals = {}
+local function addESP(part)
+    if not part or not part.Parent then return end
+    if part:FindFirstChild("_CandyESP") then return end
 
+    local h = Instance.new("Highlight")
+    h.Name               = "_CandyESP"
+    h.FillTransparency   = 0.6
+    h.FillColor          = Color3.fromRGB(255, 120, 0)
+    h.OutlineColor       = Color3.fromRGB(255, 220, 50)
+    h.OutlineTransparency = 0
+    h.Parent             = part
+
+    espHighlights[part] = h
+end
+
+local function removeAllESP()
+    for part, h in pairs(espHighlights) do
+        if h and h.Parent then h:Destroy() end
+    end
+    espHighlights = {}
+    if Connections.espWatch then
+        Connections.espWatch:Disconnect()
+        Connections.espWatch = nil
+    end
+end
+
+local function startDoorESP()
+    -- Aplica nas portas existentes
+    for _, d in ipairs(getDoorPrompts()) do
+        addESP(d.part)
+    end
+
+    -- Monitora novas portas (evento spawna dinamicamente)
+    if Connections.espWatch then Connections.espWatch:Disconnect() end
+    Connections.espWatch = workspace.DescendantAdded:Connect(function(obj)
+        if not State.doorESP then return end
+        if obj.Name == "door" and obj:IsA("BasePart") then
+            task.wait(0.1)
+            addESP(obj)
+        end
+    end)
+end
+
+-- ═══════════════════════════════════════════
+-- INSTANT DOOR
+-- HoldDuration = 0 — confirma: prompt padrão é 5s
+-- ═══════════════════════════════════════════
 local function applyInstantDoor()
-    local doors = getDoorPrompts()
-    for _, d in ipairs(doors) do
+    for _, d in ipairs(getDoorPrompts()) do
         if not instantDoorOriginals[d.prompt] then
             instantDoorOriginals[d.prompt] = d.prompt.HoldDuration
         end
@@ -151,6 +201,10 @@ local function removeInstantDoor()
         end
     end
     instantDoorOriginals = {}
+    if Connections.instantWatch then
+        Connections.instantWatch:Disconnect()
+        Connections.instantWatch = nil
+    end
 end
 
 local function startInstantDoorWatcher()
@@ -160,7 +214,6 @@ local function startInstantDoorWatcher()
     Connections.instantWatch = workspace.DescendantAdded:Connect(function(obj)
         if not State.instantDoor then return end
         if obj.Name == "door" and obj:IsA("BasePart") then
-            -- Aguarda até o ProximityPrompt existir (até 2s)
             local attempts = 0
             repeat
                 task.wait(0.2)
@@ -176,20 +229,12 @@ local function startInstantDoorWatcher()
     end)
 end
 
-local function stopInstantDoorWatcher()
-    if Connections.instantWatch then
-        Connections.instantWatch:Disconnect()
-        Connections.instantWatch = nil
-    end
-end
-
 -- ═══════════════════════════════════════════
 -- AUTO CANDY
--- FIX: flag de controle de loop + cancelamento de tween ativo
--- FIX: confirmação de coleta por desaparecimento da Part
+-- Tween de porta em porta
+-- Confirmação: espera Part sumir (porta abre e some)
 -- ═══════════════════════════════════════════
 local function startAutoCandy()
-    -- Garante que loop anterior terminou
     if LoopFlags.autoCandy then return end
     LoopFlags.autoCandy = true
 
@@ -204,8 +249,6 @@ local function startAutoCandy()
 
             for _, d in ipairs(doors) do
                 if not LoopFlags.autoCandy then break end
-
-                -- Valida referência antes de usar
                 if not d.part.Parent or not d.prompt.Parent then
                     continue
                 end
@@ -213,16 +256,13 @@ local function startAutoCandy()
                 local hrp = getHRP()
                 if not hrp then break end
 
-                local dest = CFrame.new(
-                    d.part.Position + Vector3.new(0, 4, 0)
-                )
-
-                -- Cancela tween anterior se ainda estiver rodando
+                -- Cancela tween anterior
                 if activeCandyTween then
                     activeCandyTween:Cancel()
                     activeCandyTween = nil
                 end
 
+                -- Tween suave até a porta
                 activeCandyTween = TweenService:Create(
                     hrp,
                     TweenInfo.new(
@@ -230,7 +270,7 @@ local function startAutoCandy()
                         Enum.EasingStyle.Quad,
                         Enum.EasingDirection.Out
                     ),
-                    { CFrame = dest }
+                    { CFrame = CFrame.new(d.part.Position + Vector3.new(0, 4, 0)) }
                 )
                 activeCandyTween:Play()
                 activeCandyTween.Completed:Wait()
@@ -238,15 +278,14 @@ local function startAutoCandy()
 
                 if not LoopFlags.autoCandy then break end
 
-                -- Dispara o prompt
+                -- Dispara prompt (HoldDuration já é 0 se Instant Door ativo)
                 firePromptSafe(d.prompt)
 
-                -- FIX: confirmação real — espera a Part desaparecer
-                -- (quando a porta abre, a Part "door" é removida ou muda de Parent)
-                local timeout  = tick() + 3
-                local partRef  = d.part
-                repeat
-                    task.wait(0.15)
+                -- Confirmação: espera a Part "door" sumir
+                -- (quando abre a porta, a Part é removida do Workspace)
+                local partRef = d.part
+                local timeout = tick() + 4
+                repeat task.wait(0.15)
                 until not partRef.Parent or tick() > timeout
 
                 task.wait(0.3)
@@ -260,7 +299,6 @@ end
 local function stopAutoCandy()
     LoopFlags.autoCandy = false
     State.autoCandy     = false
-    -- Cancela tween em andamento
     if activeCandyTween then
         activeCandyTween:Cancel()
         activeCandyTween = nil
@@ -269,7 +307,6 @@ end
 
 -- ═══════════════════════════════════════════
 -- AUTO PROMPT
--- FIX: flag de ciclo de vida + só portas confirmadas
 -- ═══════════════════════════════════════════
 local function startAutoPrompt()
     if LoopFlags.autoPrompt then return end
@@ -305,153 +342,77 @@ local function fireAllPP()
 end
 
 -- ═══════════════════════════════════════════
--- DOOR INVISIBILITY
--- FIX: salva posição ANTES de mover o HRP
--- FIX: CameraSubject = ghostPart (câmera livre)
--- FIX: MoveDirection sem dupla transformação
+-- DOOR INVISIBILITY — SIMPLIFICADA
+-- LocalTransparencyModifier = 1 em todas as partes
+-- Movimento e câmera 100% normais
+-- Sem ghostPart, sem Y=5000
 -- ═══════════════════════════════════════════
 local function startInvis()
-    local hrp  = getHRP()
     local char = player.Character
-    local hum  = getHumanoid()
-    if not hrp or not char or not hum then return end
+    if not char then return end
 
-    -- FIX: salva posição ANTES de qualquer movimento
-    local originalPosition = hrp.Position
-
-    State.originalCamSubject = camera.CameraSubject
-
-    -- Esconde o corpo
     for _, p in ipairs(char:GetDescendants()) do
-        if p:IsA("BasePart") then
+        if p:IsA("BasePart") or p:IsA("Decal") then
             p.LocalTransparencyModifier = 1
         end
     end
-
-    -- Ancora o corpo em Y=5000 DEPOIS de salvar a posição
-    hrp.Anchored = true
-    hrp.CFrame   = CFrame.new(0, 5000, 0)
-
-    -- Cria ghostPart na posição ORIGINAL do player
-    if ghostPart then ghostPart:Destroy() end
-    ghostPart               = Instance.new("Part")
-    ghostPart.Name          = "CandyGhost"
-    ghostPart.Size          = Vector3.new(2, 5, 1)
-    ghostPart.Transparency  = 1
-    ghostPart.CanCollide    = true
-    ghostPart.Anchored      = false
-    ghostPart.CastShadow    = false
-    ghostPart.CFrame        = CFrame.new(originalPosition)  -- FIX: posição correta
-    ghostPart.Parent        = workspace
-
-    -- BodyVelocity para movimento horizontal
-    local bv        = Instance.new("BodyVelocity")
-    bv.Velocity     = Vector3.zero
-    bv.MaxForce     = Vector3.new(1e5, 0, 1e5)
-    bv.Parent       = ghostPart
-
-    -- BodyGyro para não tombar
-    local bg        = Instance.new("BodyGyro")
-    bg.MaxTorque    = Vector3.new(0, 1e5, 0)
-    bg.P            = 1e4
-    bg.CFrame       = ghostPart.CFrame
-    bg.Parent       = ghostPart
-
-    -- Câmera segue o ghostPart em terceira pessoa
-    camera.CameraType    = Enum.CameraType.Custom
-    camera.CameraSubject = ghostPart
-
-    if Connections.ghost then Connections.ghost:Disconnect() end
-
-    local SPEED = 16
-    Connections.ghost = RunService.Heartbeat:Connect(function()
-        if not State.invis or not ghostPart then return end
-
-        local hum2 = getHumanoid()
-        local bvObj = ghostPart:FindFirstChildOfClass("BodyVelocity")
-        if not bvObj then return end
-
-        -- FIX: MoveDirection já é relativo ao mundo — sem dupla transformação
-        local vel = Vector3.zero
-        if hum2 and hum2.MoveDirection.Magnitude > 0 then
-            vel = hum2.MoveDirection * SPEED
-        end
-        bvObj.Velocity = vel
-
-        -- Mantém HRP ancorado
-        local h = getHRP()
-        if h then
-            h.CFrame = CFrame.new(0, 5000, 0)
-            h.AssemblyLinearVelocity  = Vector3.zero
-            h.AssemblyAngularVelocity = Vector3.zero
-        end
-    end)
 end
 
 local function stopInvis()
     State.invis = false
+    local char  = player.Character
+    if not char then return end
 
-    if Connections.ghost then
-        Connections.ghost:Disconnect()
-        Connections.ghost = nil
-    end
-
-    local char = player.Character
-    if char then
-        for _, p in ipairs(char:GetDescendants()) do
-            if p:IsA("BasePart") then
-                p.LocalTransparencyModifier = 0
-            end
+    for _, p in ipairs(char:GetDescendants()) do
+        if p:IsA("BasePart") or p:IsA("Decal") then
+            p.LocalTransparencyModifier = 0
         end
     end
-
-    local hrp = getHRP()
-    if hrp and ghostPart then
-        hrp.Anchored = false
-        hrp.CFrame   = CFrame.new(ghostPart.Position)
-        hrp.AssemblyLinearVelocity  = Vector3.zero
-        hrp.AssemblyAngularVelocity = Vector3.zero
-    elseif hrp then
-        hrp.Anchored = false
-    end
-
-    if ghostPart then
-        ghostPart:Destroy()
-        ghostPart = nil
-    end
-
-    -- FIX: restaura câmera com CameraSubject do Humanoid atual
-    camera.CameraType = Enum.CameraType.Custom
-    local hum = getHumanoid()
-    camera.CameraSubject = hum
-        or State.originalCamSubject
 end
 
 -- ═══════════════════════════════════════════
 -- SPEED BOOST
--- FIX: lê WalkSpeed no momento de ativar (personagem atual)
+-- Loop Heartbeat reaplica enquanto ativo
 -- ═══════════════════════════════════════════
-local speedValue = 30
+local speedConn = nil
 
 local function applySpeed(value)
     local hum = getHumanoid()
-    if hum then hum.WalkSpeed = value end
+    if hum then hum.WalkSpeed = math.floor(value) end
 end
 
 local function startSpeedBoost(value)
-    -- FIX: salva velocidade do personagem atual, não de um anterior
     local hum = getHumanoid()
     State.originalSpeed = hum and hum.WalkSpeed or 16
     applySpeed(value)
+
+    -- Loop que reaplica caso o jogo sobrescreva
+    if speedConn then speedConn:Disconnect() end
+    speedConn = RunService.Heartbeat:Connect(function()
+        if not State.speedBoost then
+            speedConn:Disconnect()
+            speedConn = nil
+            return
+        end
+        local h = getHumanoid()
+        if h and h.WalkSpeed ~= math.floor(speedValue) then
+            h.WalkSpeed = math.floor(speedValue)
+        end
+    end)
 end
 
 local function stopSpeedBoost()
-    applySpeed(State.originalSpeed)
     State.speedBoost = false
+    if speedConn then
+        speedConn:Disconnect()
+        speedConn = nil
+    end
+    applySpeed(State.originalSpeed)
 end
 
 -- ═══════════════════════════════════════════
 -- PUMPKIN EVENT
+-- Accessory "Pumpkin" nos filhos do personagem
 -- ═══════════════════════════════════════════
 local function findPumpkinCarrier()
     for _, p in ipairs(Players:GetPlayers()) do
@@ -498,14 +459,14 @@ gui.DisplayOrder = 999
 gui.Parent       = player:WaitForChild("PlayerGui")
 
 local PANEL_W    = 300
-local PANEL_H    = 340
+local PANEL_H    = 360
 local PANEL_SIZE = UDim2.fromOffset(PANEL_W, PANEL_H)
 local MINI_SIZE  = UDim2.fromOffset(PANEL_W, 48)
 
 local panel = Instance.new("Frame")
 panel.Name                   = "Panel"
 panel.Size                   = UDim2.fromOffset(0, 0)
-panel.Position               = UDim2.new(0.5, -150, 0.5, -170)
+panel.Position               = UDim2.new(0.5, -150, 0.5, -180)
 panel.BackgroundColor3       = Color3.fromRGB(25, 18, 35)
 panel.BackgroundTransparency = 1
 panel.BorderSizePixel        = 0
@@ -650,7 +611,7 @@ scrollLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
 end)
 
 -- ═══════════════════════════════════════════
--- HELPERS DE UI
+-- HELPERS UI
 -- ═══════════════════════════════════════════
 local function makeSectionLabel(text, order)
     local lbl = Instance.new("TextLabel")
@@ -798,7 +759,6 @@ local function makeSwitch(labelText, order, onEnable, onDisable)
     return row
 end
 
--- FIX: slider com suporte a arraste iniciado na track (mobile)
 local function makeSlider(labelPrefix, order, minVal, maxVal, defaultVal, onChange)
     local container = Instance.new("Frame")
     container.Size             = UDim2.new(1, 0, 0, 48)
@@ -810,7 +770,7 @@ local function makeSlider(labelPrefix, order, minVal, maxVal, defaultVal, onChan
     local lbl = Instance.new("TextLabel")
     lbl.Size               = UDim2.new(1, 0, 0, 18)
     lbl.BackgroundTransparency = 1
-    lbl.Text               = string.format("%s%.1f", labelPrefix, defaultVal)
+    lbl.Text               = string.format("%s%d", labelPrefix, defaultVal)
     lbl.TextColor3         = Color3.fromRGB(220, 200, 255)
     lbl.TextSize           = 11
     lbl.FontFace           = FONT
@@ -866,12 +826,11 @@ local function makeSlider(labelPrefix, order, minVal, maxVal, defaultVal, onChan
         local rel  = math.clamp((inputX - abs.X) / size.X, 0, 1)
         fill.Size     = UDim2.new(rel, 0, 1, 0)
         knob.Position = UDim2.new(rel, 0, 0.5, 0)
-        local val     = minVal + rel * (maxVal - minVal)
-        lbl.Text      = string.format("%s%.1f", labelPrefix, val)
+        local val     = math.floor(minVal + rel * (maxVal - minVal))
+        lbl.Text      = string.format("%s%d", labelPrefix, val)
         onChange(val)
     end
 
-    -- FIX: arraste iniciado tanto no knob quanto na track
     local function onInputBegan(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1
             or input.UserInputType == Enum.UserInputType.Touch then
@@ -883,7 +842,6 @@ local function makeSlider(labelPrefix, order, minVal, maxVal, defaultVal, onChan
     knob.InputBegan:Connect(onInputBegan)
     track.InputBegan:Connect(onInputBegan)
 
-    -- FIX: conexões globais registradas para limpeza ao fechar
     local c1 = UserInputService.InputChanged:Connect(function(i)
         if sliding and (
             i.UserInputType == Enum.UserInputType.MouseMovement or
@@ -914,17 +872,33 @@ makeSwitch("Auto Candy", ord,
     function() State.autoCandy = true  startAutoCandy()  end,
     function() stopAutoCandy() end
 ) ord = ord + 1
-makeSlider("Velocidade: ", ord, 0.1, 2.0, 0.8, function(v)
-    State.tweenSpeed = v
+makeSlider("Velocidade: ", ord, 1, 20, 8, function(v)
+    State.tweenSpeed = v / 10
 end) ord = ord + 1
 makeSep(ord) ord = ord + 1
 
 -- AUTO DOORS
 makeSectionLabel("🚪  AUTO DOORS", ord) ord = ord + 1
+
 makeSwitch("Door Invisibility", ord,
-    function() State.invis = true  startInvis()  end,
+    function()
+        State.invis = true
+        startInvis()
+    end,
     function() stopInvis() end
 ) ord = ord + 1
+
+makeSwitch("Door ESP", ord,
+    function()
+        State.doorESP = true
+        startDoorESP()
+    end,
+    function()
+        State.doorESP = false
+        removeAllESP()
+    end
+) ord = ord + 1
+
 makeSwitch("Instant Door", ord,
     function()
         State.instantDoor = true
@@ -934,7 +908,6 @@ makeSwitch("Instant Door", ord,
     function()
         State.instantDoor = false
         removeInstantDoor()
-        stopInstantDoorWatcher()
     end
 ) ord = ord + 1
 
@@ -952,7 +925,7 @@ doorListFrame.ScrollBarImageColor3 = Color3.fromRGB(160, 70, 220)
 doorListFrame.CanvasSize          = UDim2.new(0, 0, 0, 0)
 doorListFrame.Visible             = false
 doorListFrame.LayoutOrder         = ord
-doorListFrame.ZIndex              = 4
+doorListFrame.ZIndex              = 8
 doorListFrame.ClipsDescendants    = true
 doorListFrame.Parent              = scrollFrame
 Instance.new("UICorner", doorListFrame).CornerRadius = UDim.new(0, 8)
@@ -986,11 +959,11 @@ local function buildAndShowDoorList()
         local empty = Instance.new("TextLabel")
         empty.Size               = UDim2.new(1, 0, 0, 28)
         empty.BackgroundTransparency = 1
-        empty.Text               = "Nenhuma porta ativa no momento"
+        empty.Text               = "Aguardando próximo evento..."
         empty.TextColor3         = Color3.fromRGB(200, 160, 255)
         empty.TextSize           = 11
         empty.FontFace           = FONT
-        empty.ZIndex             = 5
+        empty.ZIndex             = 9
         empty.Parent             = doorListFrame
     else
         for i, d in ipairs(doors) do
@@ -1002,7 +975,7 @@ local function buildAndShowDoorList()
             item.TextSize         = 12
             item.FontFace         = FONT
             item.AutoButtonColor  = false
-            item.ZIndex           = 5
+            item.ZIndex           = 9
             item.Parent           = doorListFrame
             Instance.new("UICorner", item).CornerRadius = UDim.new(0, 6)
 
@@ -1032,9 +1005,8 @@ local function buildAndShowDoorList()
 
             item.Activated:Connect(function()
                 playClick()
-                -- FIX: valida referência antes de usar
                 if not d.part.Parent or not d.prompt.Parent then
-                    item.Text      = "Porta removida"
+                    item.Text       = "Porta removida"
                     item.TextColor3 = Color3.fromRGB(200, 100, 100)
                     return
                 end
@@ -1067,7 +1039,6 @@ local function buildAndShowDoorList()
         end
     end
 
-    -- FIX: aguarda layout atualizar antes de calcular altura
     task.wait()
     doorListFrame.CanvasSize = UDim2.new(0, 0, 0,
         dlLayout.AbsoluteContentSize.Y + 10
@@ -1108,6 +1079,7 @@ makeSep(ord) ord = ord + 1
 
 -- PROMPTS
 makeSectionLabel("⚡  PROMPTS", ord) ord = ord + 1
+
 local firePPBtn = makeBtn("⚡  Fire PP (todos)", ord, 34) ord = ord + 1
 firePPBtn.Activated:Connect(function()
     playClick()
@@ -1118,8 +1090,8 @@ local autoPromptActive = false
 local autoPromptBtn    = makeBtn("🔁  Auto Prompt: OFF", ord, 34) ord = ord + 1
 autoPromptBtn.Activated:Connect(function()
     playClick()
-    autoPromptActive  = not autoPromptActive
-    State.autoPrompt  = autoPromptActive
+    autoPromptActive   = not autoPromptActive
+    State.autoPrompt   = autoPromptActive
     autoPromptBtn.Text = autoPromptActive
         and "🔁  Auto Prompt: ON"
         or  "🔁  Auto Prompt: OFF"
@@ -1147,7 +1119,7 @@ makeSlider("Speed: ", ord, 16, 100, 30, function(v)
 end) ord = ord + 1
 makeSep(ord) ord = ord + 1
 
--- PUMPKIN EVENT
+-- PUMPKIN
 makeSectionLabel("🎃  PUMPKIN EVENT", ord) ord = ord + 1
 local pumpkinBtn = makeBtn("🎃  Ir ao Portador", ord, 34) ord = ord + 1
 pumpkinBtn.Activated:Connect(function()
@@ -1200,20 +1172,17 @@ minBtn.Activated:Connect(function()
 end)
 
 -- ═══════════════════════════════════════════
--- FECHAR — FIX: limpa conexões globais
+-- FECHAR
 -- ═══════════════════════════════════════════
 closeBtn.Activated:Connect(function()
     playClick()
     stopAutoCandy()
     stopAutoPrompt()
-    if State.invis        then stopInvis()         end
-    if State.instantDoor  then
-        removeInstantDoor()
-        stopInstantDoorWatcher()
-    end
-    if State.speedBoost   then stopSpeedBoost()    end
+    if State.invis       then stopInvis()          end
+    if State.doorESP     then removeAllESP()       end
+    if State.instantDoor then removeInstantDoor()  end
+    if State.speedBoost  then stopSpeedBoost()     end
 
-    -- FIX: desconecta todas as conexões globais dos sliders
     for _, conn in ipairs(GlobalConnections) do
         conn:Disconnect()
     end
@@ -1227,7 +1196,7 @@ closeBtn.Activated:Connect(function()
 end)
 
 -- ═══════════════════════════════════════════
--- ARRASTAR — FIX: ignora input que começa nos botões do header
+-- ARRASTAR
 -- ═══════════════════════════════════════════
 local dragging    = false
 local dragStart   = nil
@@ -1237,15 +1206,14 @@ local activeInput = nil
 header.InputBegan:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1
         or input.UserInputType == Enum.UserInputType.Touch then
-        -- FIX: não inicia arraste se o toque foi nos botões
         local pos = input.Position
-        local function isInsideBtn(btn)
+        local function inside(btn)
             local ap = btn.AbsolutePosition
             local as = btn.AbsoluteSize
             return pos.X >= ap.X and pos.X <= ap.X + as.X
                and pos.Y >= ap.Y and pos.Y <= ap.Y + as.Y
         end
-        if isInsideBtn(closeBtn) or isInsideBtn(minBtn) then return end
+        if inside(closeBtn) or inside(minBtn) then return end
 
         dragging  = true
         dragStart = input.Position
@@ -1280,41 +1248,36 @@ table.insert(GlobalConnections, dragConn)
 
 -- ═══════════════════════════════════════════
 -- RECONECTA AO RESPAWN
--- FIX: restaura câmera e velocidade com personagem atual
 -- ═══════════════════════════════════════════
 player.CharacterAdded:Connect(function(char)
-    -- Limpa invisibilidade
+    -- Restaura invisibilidade se estava ativa
     if State.invis then
-        State.invis = false
-        if Connections.ghost then
-            Connections.ghost:Disconnect()
-            Connections.ghost = nil
-        end
-        if ghostPart then
-            ghostPart:Destroy()
-            ghostPart = nil
-        end
+        task.wait(0.5)
+        startInvis()
     end
 
-    -- FIX: aguarda Humanoid do novo personagem
+    -- FIX: restaura câmera com Humanoid do novo personagem
     local hum = char:WaitForChild("Humanoid", 5)
-    camera.CameraType    = Enum.CameraType.Custom
-    camera.CameraSubject = hum or char:FindFirstChildOfClass("Humanoid")
+    if hum then
+        camera.CameraType    = Enum.CameraType.Custom
+        camera.CameraSubject = hum
+    end
 
+    -- Restaura speed
     if State.speedBoost then
         task.wait(1)
-        applySpeed(speedValue)
+        startSpeedBoost(speedValue)
     end
-    if LoopFlags.autoCandy then
-        LoopFlags.autoCandy = false  -- para loop anterior
+
+    -- Reinicia loops
+    if State.autoCandy then
+        LoopFlags.autoCandy = false
         task.wait(2)
-        State.autoCandy     = true
         startAutoCandy()
     end
-    if LoopFlags.autoPrompt then
+    if State.autoPrompt then
         LoopFlags.autoPrompt = false
         task.wait(2)
-        State.autoPrompt     = true
         startAutoPrompt()
     end
 end)
