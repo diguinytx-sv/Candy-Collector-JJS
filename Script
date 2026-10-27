@@ -1,8 +1,5 @@
 -- CANDY COLLECTOR V1
--- Jujutsu Shenanigans | Arceus X | Android
--- Correções: Door Invisibility simplificada, Part ESP nas portas,
--- HoldDuration=0 confirmado, coleta por desaparecimento da Part,
--- loop lifecycle, câmera respawn, slider mobile, conexões globais
+-- Sistema de abas deslizantes + painel original preservado
 
 local Players          = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
@@ -30,7 +27,7 @@ local TowerPosition = Vector3.new(
 )
 
 -- ═══════════════════════════════════════════
--- SOM — clone por clique
+-- SOM
 -- ═══════════════════════════════════════════
 local clickTemplate   = Instance.new("Sound")
 clickTemplate.SoundId = CLICK_ID
@@ -48,15 +45,17 @@ end
 -- ESTADO
 -- ═══════════════════════════════════════════
 local State = {
-    autoCandy    = false,
-    autoPrompt   = false,
-    invis        = false,
-    instantDoor  = false,
-    speedBoost   = false,
-    doorESP      = false,
-    tweenSpeed   = 0.8,
+    autoCandy     = false,
+    autoPrompt    = false,
+    invis         = false,
+    instantDoor   = false,
+    speedBoost    = false,
+    doorESP       = false,
+    tweenSpeed    = 0.8,
     originalSpeed = 16,
-    originalCamSubject = nil,
+    soundVolume   = 0.5,
+    panelAlpha    = 0.1,
+    antiAFK       = true,
 }
 
 local LoopFlags = {
@@ -64,20 +63,73 @@ local LoopFlags = {
     autoPrompt = false,
 }
 
-local Connections = {
-    instantWatch = nil,
-    espWatch     = nil,
+local Connections    = { instantWatch = nil, espWatch = nil }
+local GlobalConns    = {}
+local activeCandyTween = nil
+local speedValue     = 30
+local espHighlights  = {}
+local instantDoorOriginals = {}
+
+-- ═══════════════════════════════════════════
+-- ESTATÍSTICAS DA SESSÃO
+-- ═══════════════════════════════════════════
+local Stats = {
+    candyCollected = 0,
+    doorsOpened    = 0,
+    sessionStart   = os.clock(),
 }
 
-local GlobalConnections = {}
-local activeCandyTween  = nil
-local speedValue        = 30
+-- ═══════════════════════════════════════════
+-- LOG DE NOTIFICAÇÕES (máx 20 entradas)
+-- ═══════════════════════════════════════════
+local NotifLog   = {}
+local MAX_NOTIFS = 20
 
--- ESP: tabela de Highlights criados
-local espHighlights = {}
+local notifListLayout = nil  -- referência ao layout da lista de notifs
+local notifScroll     = nil  -- referência ao ScrollingFrame de notifs
 
--- Instant Door: HoldDuration originais
-local instantDoorOriginals = {}
+local function addNotif(text)
+    local t = os.date("%H:%M:%S")
+    table.insert(NotifLog, 1, string.format("[%s] %s", t, text))
+    if #NotifLog > MAX_NOTIFS then
+        table.remove(NotifLog, #NotifLog)
+    end
+    -- Atualiza UI se a aba de notifs estiver visível
+    if notifScroll and notifScroll.Parent then
+        for _, ch in ipairs(notifScroll:GetChildren()) do
+            if ch:IsA("TextLabel") then ch:Destroy() end
+        end
+        for i, entry in ipairs(NotifLog) do
+            local lbl = Instance.new("TextLabel")
+            lbl.Size               = UDim2.new(1, 0, 0, 26)
+            lbl.BackgroundColor3   = Color3.fromRGB(35, 20, 55)
+            lbl.BackgroundTransparency = 0.2
+            lbl.Text               = entry
+            lbl.TextColor3         = Color3.fromRGB(220, 200, 255)
+            lbl.TextSize           = 10
+            lbl.FontFace           = FONT
+            lbl.TextXAlignment     = Enum.TextXAlignment.Left
+            lbl.TextWrapped        = true
+            lbl.LayoutOrder        = i
+            lbl.ZIndex             = 12
+            lbl.Parent             = notifScroll
+            Instance.new("UICorner", lbl).CornerRadius = UDim.new(0, 4)
+            local ls = Instance.new("UIStroke")
+            ls.Color       = Color3.fromRGB(20, 12, 35)
+            ls.Thickness   = 1
+            ls.Parent      = lbl
+            local lp = Instance.new("UIPadding")
+            lp.PaddingLeft  = UDim.new(0, 6)
+            lp.PaddingRight = UDim.new(0, 6)
+            lp.Parent       = lbl
+        end
+        if notifListLayout then
+            notifScroll.CanvasSize = UDim2.new(0, 0, 0,
+                notifListLayout.AbsoluteContentSize.Y + 10
+            )
+        end
+    end
+end
 
 -- ═══════════════════════════════════════════
 -- HELPERS
@@ -96,6 +148,7 @@ end
 -- ANTI-AFK
 -- ═══════════════════════════════════════════
 player.Idled:Connect(function()
+    if not State.antiAFK then return end
     pcall(function()
         VirtualUser:CaptureController()
         VirtualUser:ClickButton2(Vector2.new())
@@ -104,15 +157,11 @@ end)
 
 -- ═══════════════════════════════════════════
 -- DETECÇÃO DE PORTAS
--- Part "door" com ProximityPrompt filho direto
 -- ═══════════════════════════════════════════
 local function getDoorPrompts()
     local result = {}
     for _, obj in ipairs(workspace:GetDescendants()) do
-        if obj.Name == "door"
-            and obj:IsA("BasePart")
-            and obj.Parent
-        then
+        if obj.Name == "door" and obj:IsA("BasePart") and obj.Parent then
             local prompt = obj:FindFirstChildOfClass("ProximityPrompt")
             if prompt then
                 table.insert(result, { part = obj, prompt = prompt })
@@ -134,14 +183,11 @@ local function firePromptSafe(prompt)
 end
 
 -- ═══════════════════════════════════════════
--- PART ESP
--- Highlight nas Parts "door" enquanto ESP ativo
--- Monitora novas portas adicionadas dinamicamente
+-- DOOR ESP
 -- ═══════════════════════════════════════════
 local function addESP(part)
     if not part or not part.Parent then return end
     if part:FindFirstChild("_CandyESP") then return end
-
     local h = Instance.new("Highlight")
     h.Name               = "_CandyESP"
     h.FillTransparency   = 0.6
@@ -149,12 +195,11 @@ local function addESP(part)
     h.OutlineColor       = Color3.fromRGB(255, 220, 50)
     h.OutlineTransparency = 0
     h.Parent             = part
-
-    espHighlights[part] = h
+    espHighlights[part]  = h
 end
 
 local function removeAllESP()
-    for part, h in pairs(espHighlights) do
+    for _, h in pairs(espHighlights) do
         if h and h.Parent then h:Destroy() end
     end
     espHighlights = {}
@@ -165,12 +210,7 @@ local function removeAllESP()
 end
 
 local function startDoorESP()
-    -- Aplica nas portas existentes
-    for _, d in ipairs(getDoorPrompts()) do
-        addESP(d.part)
-    end
-
-    -- Monitora novas portas (evento spawna dinamicamente)
+    for _, d in ipairs(getDoorPrompts()) do addESP(d.part) end
     if Connections.espWatch then Connections.espWatch:Disconnect() end
     Connections.espWatch = workspace.DescendantAdded:Connect(function(obj)
         if not State.doorESP then return end
@@ -183,7 +223,6 @@ end
 
 -- ═══════════════════════════════════════════
 -- INSTANT DOOR
--- HoldDuration = 0 — confirma: prompt padrão é 5s
 -- ═══════════════════════════════════════════
 local function applyInstantDoor()
     for _, d in ipairs(getDoorPrompts()) do
@@ -208,9 +247,7 @@ local function removeInstantDoor()
 end
 
 local function startInstantDoorWatcher()
-    if Connections.instantWatch then
-        Connections.instantWatch:Disconnect()
-    end
+    if Connections.instantWatch then Connections.instantWatch:Disconnect() end
     Connections.instantWatch = workspace.DescendantAdded:Connect(function(obj)
         if not State.instantDoor then return end
         if obj.Name == "door" and obj:IsA("BasePart") then
@@ -231,8 +268,6 @@ end
 
 -- ═══════════════════════════════════════════
 -- AUTO CANDY
--- Tween de porta em porta
--- Confirmação: espera Part sumir (porta abre e some)
 -- ═══════════════════════════════════════════
 local function startAutoCandy()
     if LoopFlags.autoCandy then return end
@@ -241,35 +276,23 @@ local function startAutoCandy()
     task.spawn(function()
         while LoopFlags.autoCandy do
             local doors = getDoorPrompts()
-
-            if #doors == 0 then
-                task.wait(2)
-                continue
-            end
+            if #doors == 0 then task.wait(2) continue end
 
             for _, d in ipairs(doors) do
                 if not LoopFlags.autoCandy then break end
-                if not d.part.Parent or not d.prompt.Parent then
-                    continue
-                end
+                if not d.part.Parent or not d.prompt.Parent then continue end
 
                 local hrp = getHRP()
                 if not hrp then break end
 
-                -- Cancela tween anterior
                 if activeCandyTween then
                     activeCandyTween:Cancel()
                     activeCandyTween = nil
                 end
 
-                -- Tween suave até a porta
                 activeCandyTween = TweenService:Create(
                     hrp,
-                    TweenInfo.new(
-                        State.tweenSpeed,
-                        Enum.EasingStyle.Quad,
-                        Enum.EasingDirection.Out
-                    ),
+                    TweenInfo.new(State.tweenSpeed, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
                     { CFrame = CFrame.new(d.part.Position + Vector3.new(0, 4, 0)) }
                 )
                 activeCandyTween:Play()
@@ -278,19 +301,21 @@ local function startAutoCandy()
 
                 if not LoopFlags.autoCandy then break end
 
-                -- Dispara prompt (HoldDuration já é 0 se Instant Door ativo)
                 firePromptSafe(d.prompt)
 
-                -- Confirmação: espera a Part "door" sumir
-                -- (quando abre a porta, a Part é removida do Workspace)
                 local partRef = d.part
                 local timeout = tick() + 4
                 repeat task.wait(0.15)
                 until not partRef.Parent or tick() > timeout
 
+                if not partRef.Parent then
+                    Stats.doorsOpened    = Stats.doorsOpened + 1
+                    Stats.candyCollected = Stats.candyCollected + 15
+                    addNotif("🍬 Porta coletada (+15 candy)")
+                end
+
                 task.wait(0.3)
             end
-
             task.wait(1.5)
         end
     end)
@@ -311,7 +336,6 @@ end
 local function startAutoPrompt()
     if LoopFlags.autoPrompt then return end
     LoopFlags.autoPrompt = true
-
     task.spawn(function()
         while LoopFlags.autoPrompt do
             for _, obj in ipairs(workspace:GetDescendants()) do
@@ -330,9 +354,6 @@ local function stopAutoPrompt()
     State.autoPrompt     = false
 end
 
--- ═══════════════════════════════════════════
--- FIRE PP
--- ═══════════════════════════════════════════
 local function fireAllPP()
     for _, obj in ipairs(workspace:GetDescendants()) do
         if obj:IsA("ProximityPrompt") then
@@ -342,37 +363,33 @@ local function fireAllPP()
 end
 
 -- ═══════════════════════════════════════════
--- DOOR INVISIBILITY — SIMPLIFICADA
--- LocalTransparencyModifier = 1 em todas as partes
--- Movimento e câmera 100% normais
--- Sem ghostPart, sem Y=5000
+-- DOOR INVISIBILITY
 -- ═══════════════════════════════════════════
 local function startInvis()
     local char = player.Character
     if not char then return end
-
     for _, p in ipairs(char:GetDescendants()) do
         if p:IsA("BasePart") or p:IsA("Decal") then
             p.LocalTransparencyModifier = 1
         end
     end
+    addNotif("👻 Invisibilidade ativada")
 end
 
 local function stopInvis()
     State.invis = false
     local char  = player.Character
     if not char then return end
-
     for _, p in ipairs(char:GetDescendants()) do
         if p:IsA("BasePart") or p:IsA("Decal") then
             p.LocalTransparencyModifier = 0
         end
     end
+    addNotif("👻 Invisibilidade desativada")
 end
 
 -- ═══════════════════════════════════════════
 -- SPEED BOOST
--- Loop Heartbeat reaplica enquanto ativo
 -- ═══════════════════════════════════════════
 local speedConn = nil
 
@@ -385,8 +402,6 @@ local function startSpeedBoost(value)
     local hum = getHumanoid()
     State.originalSpeed = hum and hum.WalkSpeed or 16
     applySpeed(value)
-
-    -- Loop que reaplica caso o jogo sobrescreva
     if speedConn then speedConn:Disconnect() end
     speedConn = RunService.Heartbeat:Connect(function()
         if not State.speedBoost then
@@ -399,36 +414,31 @@ local function startSpeedBoost(value)
             h.WalkSpeed = math.floor(speedValue)
         end
     end)
+    addNotif(string.format("💨 Speed Boost: %d", math.floor(value)))
 end
 
 local function stopSpeedBoost()
     State.speedBoost = false
-    if speedConn then
-        speedConn:Disconnect()
-        speedConn = nil
-    end
+    if speedConn then speedConn:Disconnect() speedConn = nil end
     applySpeed(State.originalSpeed)
 end
 
 -- ═══════════════════════════════════════════
--- PUMPKIN EVENT
--- Accessory "Pumpkin" nos filhos do personagem
+-- PUMPKIN
 -- ═══════════════════════════════════════════
 local function findPumpkinCarrier()
     for _, p in ipairs(Players:GetPlayers()) do
         local char = p.Character
         if char then
             local acc = char:FindFirstChild("Pumpkin")
-            if acc and acc:IsA("Accessory") then
-                return p, char
-            end
+            if acc and acc:IsA("Accessory") then return p, char end
         end
     end
     return nil, nil
 end
 
 -- ═══════════════════════════════════════════
--- TELEPORT TO TOWER
+-- TELEPORT
 -- ═══════════════════════════════════════════
 local function doTeleport()
     local hrp = getHRP()
@@ -443,6 +453,7 @@ local function doTeleport()
             h.AssemblyAngularVelocity = Vector3.zero
         end
     end)
+    addNotif("🏯 Teleporte para a Torre")
 end
 
 -- ═══════════════════════════════════════════
@@ -458,6 +469,7 @@ gui.ResetOnSpawn = false
 gui.DisplayOrder = 999
 gui.Parent       = player:WaitForChild("PlayerGui")
 
+-- ─── PAINEL PRINCIPAL ──────────────────────
 local PANEL_W    = 300
 local PANEL_H    = 360
 local PANEL_SIZE = UDim2.fromOffset(PANEL_W, PANEL_H)
@@ -471,7 +483,7 @@ panel.BackgroundColor3       = Color3.fromRGB(25, 18, 35)
 panel.BackgroundTransparency = 1
 panel.BorderSizePixel        = 0
 panel.ClipsDescendants       = true
-panel.ZIndex                 = 2
+panel.ZIndex                 = 10
 panel.Parent                 = gui
 
 Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 12)
@@ -492,7 +504,7 @@ studsTexture.Image              = STUDS_ID
 studsTexture.ScaleType          = Enum.ScaleType.Tile
 studsTexture.TileSize           = UDim2.fromOffset(40, 40)
 studsTexture.ImageTransparency  = 0.88
-studsTexture.ZIndex             = 2
+studsTexture.ZIndex             = 10
 studsTexture.Parent             = panel
 
 local border = Instance.new("UIStroke")
@@ -506,7 +518,7 @@ local header = Instance.new("Frame")
 header.Name                   = "Header"
 header.Size                   = UDim2.new(1, 0, 0, 46)
 header.BackgroundTransparency = 1
-header.ZIndex                 = 4
+header.ZIndex                 = 12
 header.Parent                 = panel
 
 local avatar = Instance.new("ImageLabel")
@@ -514,7 +526,7 @@ avatar.Size                   = UDim2.fromOffset(32, 32)
 avatar.Position               = UDim2.fromOffset(10, 7)
 avatar.BackgroundColor3       = Color3.fromRGB(65, 35, 85)
 avatar.BackgroundTransparency = 0.1
-avatar.ZIndex                 = 5
+avatar.ZIndex                 = 13
 avatar.Parent                 = header
 Instance.new("UICorner", avatar).CornerRadius = UDim.new(1, 0)
 local avStroke = Instance.new("UIStroke")
@@ -542,7 +554,7 @@ titleLabel.TextColor3         = Color3.fromRGB(255, 240, 220)
 titleLabel.TextSize           = 14
 titleLabel.FontFace           = FONT
 titleLabel.TextXAlignment     = Enum.TextXAlignment.Left
-titleLabel.ZIndex             = 5
+titleLabel.ZIndex             = 13
 titleLabel.Parent             = header
 
 local closeBtn = Instance.new("TextButton")
@@ -553,7 +565,7 @@ closeBtn.TextSize         = 14
 closeBtn.FontFace         = FONT
 closeBtn.TextColor3       = Color3.new(1,1,1)
 closeBtn.BackgroundColor3 = Color3.fromRGB(110, 40, 55)
-closeBtn.ZIndex           = 5
+closeBtn.ZIndex           = 13
 closeBtn.Parent           = header
 Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 6)
 
@@ -565,7 +577,7 @@ minBtn.TextSize         = 18
 minBtn.FontFace         = FONT
 minBtn.TextColor3       = Color3.new(1,1,1)
 minBtn.BackgroundColor3 = Color3.fromRGB(75, 45, 105)
-minBtn.ZIndex           = 5
+minBtn.ZIndex           = 13
 minBtn.Parent           = header
 Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 6)
 
@@ -575,45 +587,57 @@ headerSep.Position         = UDim2.fromOffset(10, 44)
 headerSep.BackgroundColor3 = Color3.fromRGB(200, 140, 80)
 headerSep.BackgroundTransparency = 0.5
 headerSep.BorderSizePixel  = 0
-headerSep.ZIndex           = 4
+headerSep.ZIndex           = 12
 headerSep.Parent           = panel
 
--- ─── SCROLL ────────────────────────────────
-local scrollFrame = Instance.new("ScrollingFrame")
-scrollFrame.Name                = "ScrollContent"
-scrollFrame.Size                = UDim2.new(1, 0, 1, -48)
-scrollFrame.Position            = UDim2.fromOffset(0, 47)
-scrollFrame.BackgroundTransparency = 1
-scrollFrame.BorderSizePixel     = 0
-scrollFrame.ScrollBarThickness  = 3
-scrollFrame.ScrollBarImageColor3 = Color3.fromRGB(180, 80, 255)
-scrollFrame.CanvasSize          = UDim2.new(0, 0, 0, 0)
-scrollFrame.ZIndex              = 3
-scrollFrame.ClipsDescendants    = true
-scrollFrame.Parent              = panel
-
-local scrollLayout = Instance.new("UIListLayout")
-scrollLayout.Padding   = UDim.new(0, 6)
-scrollLayout.SortOrder = Enum.SortOrder.LayoutOrder
-scrollLayout.Parent    = scrollFrame
-
-local scrollPad = Instance.new("UIPadding")
-scrollPad.PaddingTop    = UDim.new(0, 8)
-scrollPad.PaddingBottom = UDim.new(0, 8)
-scrollPad.PaddingLeft   = UDim.new(0, 10)
-scrollPad.PaddingRight  = UDim.new(0, 10)
-scrollPad.Parent        = scrollFrame
-
-scrollLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
-    scrollFrame.CanvasSize = UDim2.new(0, 0, 0,
-        scrollLayout.AbsoluteContentSize.Y + 16
-    )
-end)
+-- ═══════════════════════════════════════════
+-- CONTAINER DE ABAS (dentro do painel, abaixo do header)
+-- ═══════════════════════════════════════════
+local tabContainer = Instance.new("Frame")
+tabContainer.Name                   = "TabContainer"
+tabContainer.Size                   = UDim2.new(1, 0, 1, -48)
+tabContainer.Position               = UDim2.fromOffset(0, 47)
+tabContainer.BackgroundTransparency = 1
+tabContainer.ClipsDescendants       = true
+tabContainer.ZIndex                 = 11
+tabContainer.Parent                 = panel
 
 -- ═══════════════════════════════════════════
 -- HELPERS UI
 -- ═══════════════════════════════════════════
-local function makeSectionLabel(text, order)
+local function makeScrollFrame(parent)
+    local sf = Instance.new("ScrollingFrame")
+    sf.Size                = UDim2.new(1, 0, 1, 0)
+    sf.BackgroundTransparency = 1
+    sf.BorderSizePixel     = 0
+    sf.ScrollBarThickness  = 3
+    sf.ScrollBarImageColor3 = Color3.fromRGB(180, 80, 255)
+    sf.CanvasSize          = UDim2.new(0, 0, 0, 0)
+    sf.ClipsDescendants    = true
+    sf.ZIndex              = 12
+    sf.Visible             = false
+    sf.Parent              = parent
+
+    local layout = Instance.new("UIListLayout")
+    layout.Padding   = UDim.new(0, 6)
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Parent    = sf
+
+    local pad = Instance.new("UIPadding")
+    pad.PaddingTop    = UDim.new(0, 8)
+    pad.PaddingBottom = UDim.new(0, 8)
+    pad.PaddingLeft   = UDim.new(0, 10)
+    pad.PaddingRight  = UDim.new(0, 10)
+    pad.Parent        = sf
+
+    layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+        sf.CanvasSize = UDim2.new(0, 0, 0, layout.AbsoluteContentSize.Y + 16)
+    end)
+
+    return sf, layout
+end
+
+local function makeSectionLabel(parent, text, order)
     local lbl = Instance.new("TextLabel")
     lbl.Size               = UDim2.new(1, 0, 0, 18)
     lbl.BackgroundTransparency = 1
@@ -623,22 +647,22 @@ local function makeSectionLabel(text, order)
     lbl.FontFace           = FONT
     lbl.TextXAlignment     = Enum.TextXAlignment.Left
     lbl.LayoutOrder        = order
-    lbl.ZIndex             = 4
-    lbl.Parent             = scrollFrame
+    lbl.ZIndex             = 13
+    lbl.Parent             = parent
 end
 
-local function makeSep(order)
+local function makeSep(parent, order)
     local f = Instance.new("Frame")
     f.Size             = UDim2.new(1, 0, 0, 1)
     f.BackgroundColor3 = Color3.fromRGB(180, 120, 60)
     f.BackgroundTransparency = 0.6
     f.BorderSizePixel  = 0
     f.LayoutOrder      = order
-    f.ZIndex           = 4
-    f.Parent           = scrollFrame
+    f.ZIndex           = 13
+    f.Parent           = parent
 end
 
-local function makeBtn(text, order, h)
+local function makeBtn(parent, text, order, h)
     h = h or 34
     local btn = Instance.new("TextButton")
     btn.Size             = UDim2.new(1, 0, 0, h)
@@ -649,8 +673,8 @@ local function makeBtn(text, order, h)
     btn.FontFace         = FONT
     btn.AutoButtonColor  = false
     btn.LayoutOrder      = order
-    btn.ZIndex           = 4
-    btn.Parent           = scrollFrame
+    btn.ZIndex           = 13
+    btn.Parent           = parent
     Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 8)
 
     local g = Instance.new("UIGradient")
@@ -681,20 +705,20 @@ local function makeBtn(text, order, h)
     return btn
 end
 
-local function makeSwitch(labelText, order, onEnable, onDisable)
+local function makeSwitch(parent, labelText, order, onEnable, onDisable)
     local row = Instance.new("Frame")
     row.Size             = UDim2.new(1, 0, 0, 34)
     row.BackgroundColor3 = Color3.fromRGB(30, 18, 48)
     row.BorderSizePixel  = 0
     row.LayoutOrder      = order
-    row.ZIndex           = 4
-    row.Parent           = scrollFrame
+    row.ZIndex           = 13
+    row.Parent           = parent
     Instance.new("UICorner", row).CornerRadius = UDim.new(0, 8)
 
     local rStroke = Instance.new("UIStroke")
-    rStroke.Color       = Color3.fromRGB(20, 12, 35)
-    rStroke.Thickness   = 1
-    rStroke.Parent      = row
+    rStroke.Color     = Color3.fromRGB(20, 12, 35)
+    rStroke.Thickness = 1
+    rStroke.Parent    = row
 
     local rGrad = Instance.new("UIGradient")
     rGrad.Color = ColorSequence.new({
@@ -713,7 +737,7 @@ local function makeSwitch(labelText, order, onEnable, onDisable)
     lbl.TextSize           = 13
     lbl.FontFace           = FONT
     lbl.TextXAlignment     = Enum.TextXAlignment.Left
-    lbl.ZIndex             = 5
+    lbl.ZIndex             = 14
     lbl.Parent             = row
 
     local track = Instance.new("TextButton")
@@ -722,20 +746,20 @@ local function makeSwitch(labelText, order, onEnable, onDisable)
     track.BackgroundColor3 = Color3.fromRGB(50, 40, 60)
     track.Text             = ""
     track.AutoButtonColor  = false
-    track.ZIndex           = 5
+    track.ZIndex           = 14
     track.Parent           = row
     Instance.new("UICorner", track).CornerRadius = UDim.new(1, 0)
 
     local tStroke = Instance.new("UIStroke")
-    tStroke.Color       = Color3.fromRGB(20, 12, 35)
-    tStroke.Thickness   = 1
-    tStroke.Parent      = track
+    tStroke.Color     = Color3.fromRGB(20, 12, 35)
+    tStroke.Thickness = 1
+    tStroke.Parent    = track
 
     local knob = Instance.new("Frame")
     knob.Size             = UDim2.fromOffset(18, 18)
     knob.Position         = UDim2.fromOffset(3, 3)
     knob.BackgroundColor3 = Color3.fromRGB(200, 190, 210)
-    knob.ZIndex           = 6
+    knob.ZIndex           = 15
     knob.Parent           = track
     Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
 
@@ -759,13 +783,13 @@ local function makeSwitch(labelText, order, onEnable, onDisable)
     return row
 end
 
-local function makeSlider(labelPrefix, order, minVal, maxVal, defaultVal, onChange)
+local function makeSlider(parent, labelPrefix, order, minVal, maxVal, defaultVal, onChange)
     local container = Instance.new("Frame")
     container.Size             = UDim2.new(1, 0, 0, 48)
     container.BackgroundTransparency = 1
     container.LayoutOrder      = order
-    container.ZIndex           = 4
-    container.Parent           = scrollFrame
+    container.ZIndex           = 13
+    container.Parent           = parent
 
     local lbl = Instance.new("TextLabel")
     lbl.Size               = UDim2.new(1, 0, 0, 18)
@@ -775,7 +799,7 @@ local function makeSlider(labelPrefix, order, minVal, maxVal, defaultVal, onChan
     lbl.TextSize           = 11
     lbl.FontFace           = FONT
     lbl.TextXAlignment     = Enum.TextXAlignment.Left
-    lbl.ZIndex             = 5
+    lbl.ZIndex             = 14
     lbl.Parent             = container
 
     local track = Instance.new("Frame")
@@ -783,14 +807,14 @@ local function makeSlider(labelPrefix, order, minVal, maxVal, defaultVal, onChan
     track.Position         = UDim2.fromOffset(0, 24)
     track.BackgroundColor3 = Color3.fromRGB(40, 28, 58)
     track.BorderSizePixel  = 0
-    track.ZIndex           = 5
+    track.ZIndex           = 14
     track.Parent           = container
     Instance.new("UICorner", track).CornerRadius = UDim.new(1, 0)
 
     local tStroke = Instance.new("UIStroke")
-    tStroke.Color       = Color3.fromRGB(20, 12, 35)
-    tStroke.Thickness   = 1
-    tStroke.Parent      = track
+    tStroke.Color     = Color3.fromRGB(20, 12, 35)
+    tStroke.Thickness = 1
+    tStroke.Parent    = track
 
     local defaultRel = (defaultVal - minVal) / (maxVal - minVal)
 
@@ -798,7 +822,7 @@ local function makeSlider(labelPrefix, order, minVal, maxVal, defaultVal, onChan
     fill.Size             = UDim2.new(defaultRel, 0, 1, 0)
     fill.BackgroundColor3 = Color3.fromRGB(160, 70, 220)
     fill.BorderSizePixel  = 0
-    fill.ZIndex           = 6
+    fill.ZIndex           = 15
     fill.Parent           = track
     Instance.new("UICorner", fill).CornerRadius = UDim.new(1, 0)
 
@@ -808,14 +832,14 @@ local function makeSlider(labelPrefix, order, minVal, maxVal, defaultVal, onChan
     knob.Position         = UDim2.new(defaultRel, 0, 0.5, 0)
     knob.BackgroundColor3 = Color3.fromRGB(210, 170, 255)
     knob.Text             = ""
-    knob.ZIndex           = 7
+    knob.ZIndex           = 16
     knob.Parent           = track
     Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
 
     local kStroke = Instance.new("UIStroke")
-    kStroke.Color       = Color3.fromRGB(20, 12, 35)
-    kStroke.Thickness   = 1
-    kStroke.Parent      = knob
+    kStroke.Color     = Color3.fromRGB(20, 12, 35)
+    kStroke.Thickness = 1
+    kStroke.Parent    = knob
 
     local sliding = false
 
@@ -855,51 +879,38 @@ local function makeSlider(labelPrefix, order, minVal, maxVal, defaultVal, onChan
         end
     end)
 
-    table.insert(GlobalConnections, c1)
-    table.insert(GlobalConnections, c2)
+    table.insert(GlobalConns, c1)
+    table.insert(GlobalConns, c2)
 
     return container
 end
 
 -- ═══════════════════════════════════════════
--- LAYOUT
+-- ABA 1: FUNÇÕES
 -- ═══════════════════════════════════════════
+local tab1, _ = makeScrollFrame(tabContainer)
 local ord = 1
 
--- CANDY
-makeSectionLabel("🍬  AUTO CANDY", ord) ord = ord + 1
-makeSwitch("Auto Candy", ord,
+makeSectionLabel(tab1, "🍬  AUTO CANDY", ord) ord = ord + 1
+makeSwitch(tab1, "Auto Candy", ord,
     function() State.autoCandy = true  startAutoCandy()  end,
     function() stopAutoCandy() end
 ) ord = ord + 1
-makeSlider("Velocidade: ", ord, 1, 20, 8, function(v)
+makeSlider(tab1, "Velocidade: ", ord, 1, 20, 8, function(v)
     State.tweenSpeed = v / 10
 end) ord = ord + 1
-makeSep(ord) ord = ord + 1
+makeSep(tab1, ord) ord = ord + 1
 
--- AUTO DOORS
-makeSectionLabel("🚪  AUTO DOORS", ord) ord = ord + 1
-
-makeSwitch("Door Invisibility", ord,
-    function()
-        State.invis = true
-        startInvis()
-    end,
+makeSectionLabel(tab1, "🚪  AUTO DOORS", ord) ord = ord + 1
+makeSwitch(tab1, "Door Invisibility", ord,
+    function() State.invis = true  startInvis()  end,
     function() stopInvis() end
 ) ord = ord + 1
-
-makeSwitch("Door ESP", ord,
-    function()
-        State.doorESP = true
-        startDoorESP()
-    end,
-    function()
-        State.doorESP = false
-        removeAllESP()
-    end
+makeSwitch(tab1, "Door ESP", ord,
+    function() State.doorESP = true  startDoorESP() end,
+    function() State.doorESP = false removeAllESP() end
 ) ord = ord + 1
-
-makeSwitch("Instant Door", ord,
+makeSwitch(tab1, "Instant Door", ord,
     function()
         State.instantDoor = true
         applyInstantDoor()
@@ -912,10 +923,9 @@ makeSwitch("Instant Door", ord,
 ) ord = ord + 1
 
 -- TP Door + lista
-local tpDoorBtn = makeBtn("🚪  TP Door", ord, 34) ord = ord + 1
+local tpDoorBtn = makeBtn(tab1, "🚪  TP Door", ord, 34) ord = ord + 1
 
 local doorListFrame = Instance.new("ScrollingFrame")
-doorListFrame.Name                = "DoorList"
 doorListFrame.Size                = UDim2.new(1, 0, 0, 0)
 doorListFrame.BackgroundColor3    = Color3.fromRGB(20, 12, 32)
 doorListFrame.BackgroundTransparency = 0.05
@@ -925,9 +935,9 @@ doorListFrame.ScrollBarImageColor3 = Color3.fromRGB(160, 70, 220)
 doorListFrame.CanvasSize          = UDim2.new(0, 0, 0, 0)
 doorListFrame.Visible             = false
 doorListFrame.LayoutOrder         = ord
-doorListFrame.ZIndex              = 8
+doorListFrame.ZIndex              = 14
 doorListFrame.ClipsDescendants    = true
-doorListFrame.Parent              = scrollFrame
+doorListFrame.Parent              = tab1
 Instance.new("UICorner", doorListFrame).CornerRadius = UDim.new(0, 8)
 local dlStroke = Instance.new("UIStroke")
 dlStroke.Color    = Color3.fromRGB(20, 12, 35)
@@ -948,9 +958,7 @@ local doorListOpen = false
 
 local function buildAndShowDoorList()
     for _, ch in ipairs(doorListFrame:GetChildren()) do
-        if ch:IsA("TextButton") or ch:IsA("TextLabel") then
-            ch:Destroy()
-        end
+        if ch:IsA("TextButton") or ch:IsA("TextLabel") then ch:Destroy() end
     end
 
     local doors = getDoorPrompts()
@@ -963,7 +971,7 @@ local function buildAndShowDoorList()
         empty.TextColor3         = Color3.fromRGB(200, 160, 255)
         empty.TextSize           = 11
         empty.FontFace           = FONT
-        empty.ZIndex             = 9
+        empty.ZIndex             = 15
         empty.Parent             = doorListFrame
     else
         for i, d in ipairs(doors) do
@@ -975,15 +983,13 @@ local function buildAndShowDoorList()
             item.TextSize         = 12
             item.FontFace         = FONT
             item.AutoButtonColor  = false
-            item.ZIndex           = 9
+            item.ZIndex           = 15
             item.Parent           = doorListFrame
             Instance.new("UICorner", item).CornerRadius = UDim.new(0, 6)
-
             local iStroke = Instance.new("UIStroke")
             iStroke.Color     = Color3.fromRGB(20, 12, 35)
             iStroke.Thickness = 1
             iStroke.Parent    = item
-
             local iGrad = Instance.new("UIGradient")
             iGrad.Color = ColorSequence.new({
                 ColorSequenceKeypoint.new(0, Color3.fromRGB(65, 38, 100)),
@@ -1013,9 +1019,7 @@ local function buildAndShowDoorList()
                 local hrp = getHRP()
                 if hrp then
                     hrp.Anchored = true
-                    hrp.CFrame   = CFrame.new(
-                        d.part.Position + Vector3.new(0, 4, 0)
-                    )
+                    hrp.CFrame   = CFrame.new(d.part.Position + Vector3.new(0, 4, 0))
                     task.delay(1, function()
                         local h = getHRP()
                         if h then
@@ -1025,24 +1029,19 @@ local function buildAndShowDoorList()
                         end
                     end)
                     firePromptSafe(d.prompt)
+                    addNotif(string.format("🚪 TP Porta %d", i))
                 end
-
                 doorListOpen = false
-                TweenService:Create(doorListFrame,
-                    TweenInfo.new(0.2, Enum.EasingStyle.Cubic), {
+                TweenService:Create(doorListFrame, TweenInfo.new(0.2, Enum.EasingStyle.Cubic), {
                     Size = UDim2.new(1, 0, 0, 0),
                 }):Play()
-                task.delay(0.2, function()
-                    doorListFrame.Visible = false
-                end)
+                task.delay(0.2, function() doorListFrame.Visible = false end)
             end)
         end
     end
 
     task.wait()
-    doorListFrame.CanvasSize = UDim2.new(0, 0, 0,
-        dlLayout.AbsoluteContentSize.Y + 10
-    )
+    doorListFrame.CanvasSize = UDim2.new(0, 0, 0, dlLayout.AbsoluteContentSize.Y + 10)
     local targetH = math.min(dlLayout.AbsoluteContentSize.Y + 10, 150)
     doorListFrame.Visible = true
     doorListFrame.Size    = UDim2.new(1, 0, 0, 0)
@@ -1058,70 +1057,58 @@ tpDoorBtn.Activated:Connect(function()
     if doorListOpen then
         buildAndShowDoorList()
     else
-        TweenService:Create(doorListFrame,
-            TweenInfo.new(0.2, Enum.EasingStyle.Cubic), {
+        TweenService:Create(doorListFrame, TweenInfo.new(0.2, Enum.EasingStyle.Cubic), {
             Size = UDim2.new(1, 0, 0, 0),
         }):Play()
-        task.delay(0.2, function()
-            doorListFrame.Visible = false
-        end)
+        task.delay(0.2, function() doorListFrame.Visible = false end)
     end
 end)
 
-local fireDoorBtn = makeBtn("⚡  Fire Door PP", ord, 34) ord = ord + 1
+local fireDoorBtn = makeBtn(tab1, "⚡  Fire Door PP", ord, 34) ord = ord + 1
 fireDoorBtn.Activated:Connect(function()
     playClick()
-    for _, d in ipairs(getDoorPrompts()) do
-        firePromptSafe(d.prompt)
-    end
+    for _, d in ipairs(getDoorPrompts()) do firePromptSafe(d.prompt) end
+    addNotif("⚡ Fire Door PP disparado")
 end)
-makeSep(ord) ord = ord + 1
+makeSep(tab1, ord) ord = ord + 1
 
--- PROMPTS
-makeSectionLabel("⚡  PROMPTS", ord) ord = ord + 1
-
-local firePPBtn = makeBtn("⚡  Fire PP (todos)", ord, 34) ord = ord + 1
+makeSectionLabel(tab1, "⚡  PROMPTS", ord) ord = ord + 1
+local firePPBtn = makeBtn(tab1, "⚡  Fire PP (todos)", ord, 34) ord = ord + 1
 firePPBtn.Activated:Connect(function()
     playClick()
     fireAllPP()
+    addNotif("⚡ Fire PP disparado")
 end)
 
 local autoPromptActive = false
-local autoPromptBtn    = makeBtn("🔁  Auto Prompt: OFF", ord, 34) ord = ord + 1
+local autoPromptBtn    = makeBtn(tab1, "🔁  Auto Prompt: OFF", ord, 34) ord = ord + 1
 autoPromptBtn.Activated:Connect(function()
     playClick()
     autoPromptActive   = not autoPromptActive
     State.autoPrompt   = autoPromptActive
-    autoPromptBtn.Text = autoPromptActive
-        and "🔁  Auto Prompt: ON"
-        or  "🔁  Auto Prompt: OFF"
+    autoPromptBtn.Text = autoPromptActive and "🔁  Auto Prompt: ON" or "🔁  Auto Prompt: OFF"
     TweenService:Create(autoPromptBtn, TweenInfo.new(0.15), {
         BackgroundColor3 = autoPromptActive
-            and Color3.fromRGB(100, 40, 160)
-            or  Color3.fromRGB(30, 18, 48),
+            and Color3.fromRGB(100, 40, 160) or Color3.fromRGB(30, 18, 48),
     }):Play()
     if autoPromptActive then startAutoPrompt() else stopAutoPrompt() end
+    addNotif("🔁 Auto Prompt: " .. (autoPromptActive and "ON" or "OFF"))
 end)
-makeSep(ord) ord = ord + 1
+makeSep(tab1, ord) ord = ord + 1
 
--- SPEED BOOST
-makeSectionLabel("💨  SPEED BOOST", ord) ord = ord + 1
-makeSwitch("Speed Boost", ord,
-    function()
-        State.speedBoost = true
-        startSpeedBoost(speedValue)
-    end,
+makeSectionLabel(tab1, "💨  SPEED BOOST", ord) ord = ord + 1
+makeSwitch(tab1, "Speed Boost", ord,
+    function() State.speedBoost = true  startSpeedBoost(speedValue) end,
     function() stopSpeedBoost() end
 ) ord = ord + 1
-makeSlider("Speed: ", ord, 16, 100, 30, function(v)
+makeSlider(tab1, "Speed: ", ord, 16, 100, 30, function(v)
     speedValue = v
     if State.speedBoost then applySpeed(v) end
 end) ord = ord + 1
-makeSep(ord) ord = ord + 1
+makeSep(tab1, ord) ord = ord + 1
 
--- PUMPKIN
-makeSectionLabel("🎃  PUMPKIN EVENT", ord) ord = ord + 1
-local pumpkinBtn = makeBtn("🎃  Ir ao Portador", ord, 34) ord = ord + 1
+makeSectionLabel(tab1, "🎃  PUMPKIN EVENT", ord) ord = ord + 1
+local pumpkinBtn = makeBtn(tab1, "🎃  Ir ao Portador", ord, 34) ord = ord + 1
 pumpkinBtn.Activated:Connect(function()
     playClick()
     local carrier, _ = findPumpkinCarrier()
@@ -1140,18 +1127,487 @@ pumpkinBtn.Activated:Connect(function()
                     h.AssemblyAngularVelocity = Vector3.zero
                 end
             end)
+            addNotif("🎃 TP para " .. carrier.Name)
         end
+    else
+        addNotif("🎃 Nenhum portador encontrado")
     end
 end)
-makeSep(ord) ord = ord + 1
+makeSep(tab1, ord) ord = ord + 1
 
--- TELEPORTE
-makeSectionLabel("🏯  TELEPORTE", ord) ord = ord + 1
-local tpTowerBtn = makeBtn("🏯  Teleport to Tower", ord, 34) ord = ord + 1
+makeSectionLabel(tab1, "🏯  TELEPORTE", ord) ord = ord + 1
+local tpTowerBtn = makeBtn(tab1, "🏯  Teleport to Tower", ord, 34)
 tpTowerBtn.Activated:Connect(function()
     playClick()
     doTeleport()
 end)
+
+-- ═══════════════════════════════════════════
+-- ABA 2: STATUS
+-- ═══════════════════════════════════════════
+local tab2, _ = makeScrollFrame(tabContainer)
+
+-- Labels de status que serão atualizadas
+local statusLabels = {}
+
+local function makeStatusRow(parent, icon, labelText, order)
+    local row = Instance.new("Frame")
+    row.Size             = UDim2.new(1, 0, 0, 38)
+    row.BackgroundColor3 = Color3.fromRGB(30, 18, 48)
+    row.BorderSizePixel  = 0
+    row.LayoutOrder      = order
+    row.ZIndex           = 13
+    row.Parent           = parent
+    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 8)
+    local rs = Instance.new("UIStroke")
+    rs.Color     = Color3.fromRGB(20, 12, 35)
+    rs.Thickness = 1
+    rs.Parent    = row
+    local rg = Instance.new("UIGradient")
+    rg.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(55, 30, 85)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(28, 14, 50)),
+    })
+    rg.Rotation = 90
+    rg.Parent   = row
+
+    local iconLbl = Instance.new("TextLabel")
+    iconLbl.Size               = UDim2.fromOffset(30, 38)
+    iconLbl.Position           = UDim2.fromOffset(6, 0)
+    iconLbl.BackgroundTransparency = 1
+    iconLbl.Text               = icon
+    iconLbl.TextSize           = 16
+    iconLbl.FontFace           = FONT
+    iconLbl.ZIndex             = 14
+    iconLbl.Parent             = row
+
+    local nameLbl = Instance.new("TextLabel")
+    nameLbl.Size               = UDim2.new(0.5, -36, 1, 0)
+    nameLbl.Position           = UDim2.fromOffset(38, 0)
+    nameLbl.BackgroundTransparency = 1
+    nameLbl.Text               = labelText
+    nameLbl.TextColor3         = Color3.fromRGB(200, 185, 220)
+    nameLbl.TextSize           = 11
+    nameLbl.FontFace           = FONT
+    nameLbl.TextXAlignment     = Enum.TextXAlignment.Left
+    nameLbl.ZIndex             = 14
+    nameLbl.Parent             = row
+
+    local valLbl = Instance.new("TextLabel")
+    valLbl.Size               = UDim2.new(0.45, 0, 1, 0)
+    valLbl.Position           = UDim2.new(0.55, 0, 0, 0)
+    valLbl.BackgroundTransparency = 1
+    valLbl.Text               = "—"
+    valLbl.TextColor3         = Color3.fromRGB(255, 200, 80)
+    valLbl.TextSize           = 12
+    valLbl.FontFace           = FONT
+    valLbl.TextXAlignment     = Enum.TextXAlignment.Right
+    valLbl.ZIndex             = 14
+    valLbl.Parent             = row
+
+    local pad = Instance.new("UIPadding")
+    pad.PaddingRight = UDim.new(0, 10)
+    pad.Parent       = valLbl
+
+    return valLbl
+end
+
+local o2 = 1
+makeSectionLabel(tab2, "📊  STATUS DA SESSÃO", o2) o2 = o2 + 1
+statusLabels.candy   = makeStatusRow(tab2, "🍬", "Candy coletado",  o2) o2 = o2 + 1
+statusLabels.doors   = makeStatusRow(tab2, "🚪", "Portas abertas",  o2) o2 = o2 + 1
+statusLabels.uptime  = makeStatusRow(tab2, "⏱", "Uptime",          o2) o2 = o2 + 1
+makeSep(tab2, o2) o2 = o2 + 1
+makeSectionLabel(tab2, "⚡  FUNÇÕES ATIVAS", o2) o2 = o2 + 1
+statusLabels.autoCandy   = makeStatusRow(tab2, "🍬", "Auto Candy",       o2) o2 = o2 + 1
+statusLabels.invis       = makeStatusRow(tab2, "👻", "Invisibilidade",    o2) o2 = o2 + 1
+statusLabels.instantDoor = makeStatusRow(tab2, "🚪", "Instant Door",      o2) o2 = o2 + 1
+statusLabels.doorESP     = makeStatusRow(tab2, "🔦", "Door ESP",          o2) o2 = o2 + 1
+statusLabels.speedBoost  = makeStatusRow(tab2, "💨", "Speed Boost",       o2) o2 = o2 + 1
+statusLabels.autoPrompt  = makeStatusRow(tab2, "🔁", "Auto Prompt",       o2) o2 = o2 + 1
+statusLabels.antiAFK     = makeStatusRow(tab2, "🛡", "Anti-AFK",          o2)
+
+-- Loop de atualização do status
+local statusUpdateConn = nil
+local function startStatusUpdate()
+    if statusUpdateConn then return end
+    statusUpdateConn = RunService.Heartbeat:Connect(function()
+        if not tab2.Visible then return end
+        local elapsed = os.clock() - Stats.sessionStart
+        local mins    = math.floor(elapsed / 60)
+        local secs    = math.floor(elapsed % 60)
+
+        statusLabels.candy.Text       = tostring(Stats.candyCollected)
+        statusLabels.doors.Text       = tostring(Stats.doorsOpened)
+        statusLabels.uptime.Text      = string.format("%02d:%02d", mins, secs)
+        statusLabels.autoCandy.Text   = State.autoCandy   and "✅ ON" or "⭕ OFF"
+        statusLabels.invis.Text       = State.invis       and "✅ ON" or "⭕ OFF"
+        statusLabels.instantDoor.Text = State.instantDoor and "✅ ON" or "⭕ OFF"
+        statusLabels.doorESP.Text     = State.doorESP     and "✅ ON" or "⭕ OFF"
+        statusLabels.speedBoost.Text  = State.speedBoost  and "✅ ON" or "⭕ OFF"
+        statusLabels.autoPrompt.Text  = State.autoPrompt  and "✅ ON" or "⭕ OFF"
+        statusLabels.antiAFK.Text     = State.antiAFK     and "✅ ON" or "⭕ OFF"
+    end)
+end
+startStatusUpdate()
+
+-- ═══════════════════════════════════════════
+-- ABA 3: NOTIFICAÇÕES
+-- ═══════════════════════════════════════════
+local tab3, notifLayout = makeScrollFrame(tabContainer)
+notifListLayout = notifLayout
+notifScroll     = tab3
+
+local o3 = 1
+makeSectionLabel(tab3, "🔔  HISTÓRICO", o3)
+
+-- ═══════════════════════════════════════════
+-- ABA 4: CONFIGURAÇÕES
+-- ═══════════════════════════════════════════
+local tab4, _ = makeScrollFrame(tabContainer)
+local o4 = 1
+
+makeSectionLabel(tab4, "⚙️  CONFIGURAÇÕES", o4) o4 = o4 + 1
+
+-- Toggle Anti-AFK
+makeSwitch(tab4, "Anti-AFK", o4,
+    function() State.antiAFK = true  addNotif("🛡 Anti-AFK: ON")  end,
+    function() State.antiAFK = false addNotif("🛡 Anti-AFK: OFF") end
+) o4 = o4 + 1
+
+-- Slider volume do som
+makeSlider(tab4, "Volume clique: ", o4, 0, 10, 5, function(v)
+    State.soundVolume  = v / 10
+    clickTemplate.Volume = State.soundVolume
+end) o4 = o4 + 1
+
+-- Slider transparência do painel
+makeSlider(tab4, "Transparência: ", o4, 0, 9, 1, function(v)
+    State.panelAlpha = v / 10
+    panel.BackgroundTransparency = State.panelAlpha
+end) o4 = o4 + 1
+
+makeSep(tab4, o4) o4 = o4 + 1
+
+-- Resetar posição do painel
+local resetPosBtn = makeBtn(tab4, "📌  Resetar Posição", o4, 34) o4 = o4 + 1
+resetPosBtn.Activated:Connect(function()
+    playClick()
+    TweenService:Create(panel,
+        TweenInfo.new(0.3, Enum.EasingStyle.Cubic, Enum.EasingDirection.Out), {
+        Position = UDim2.new(0.5, -150, 0.5, -180),
+    }):Play()
+    addNotif("📌 Painel reposicionado")
+end)
+
+makeSep(tab4, o4) o4 = o4 + 1
+
+-- Limpar log de notificações
+local clearLogBtn = makeBtn(tab4, "🗑  Limpar Notificações", o4, 34)
+clearLogBtn.Activated:Connect(function()
+    playClick()
+    NotifLog = {}
+    for _, ch in ipairs(notifScroll:GetChildren()) do
+        if ch:IsA("TextLabel") and ch.LayoutOrder ~= 1 then
+            ch:Destroy()
+        end
+    end
+    addNotif("🗑 Log limpo")
+end)
+
+-- ═══════════════════════════════════════════
+-- SISTEMA DE ABAS
+-- ═══════════════════════════════════════════
+local tabs     = { tab1, tab2, tab3, tab4 }
+local currentTab = 1
+
+local function selectTab(index)
+    currentTab = index
+    for i, tab in ipairs(tabs) do
+        tab.Visible = (i == index)
+        if i == index then tab.CanvasPosition = Vector2.zero end
+    end
+end
+
+selectTab(1)
+
+-- ═══════════════════════════════════════════
+-- BOTÕES FLUTUANTES DE ABA
+-- Posicionados atrás do painel (ZIndex menor)
+-- Saem para a ESQUERDA ao abrir
+-- ═══════════════════════════════════════════
+local TAB_BTN_SIZE   = 40
+local TAB_BTN_GAP    = 8
+local AUTO_HIDE_TIME = 4  -- segundos para recolher automaticamente
+
+local tabDefs = {
+    { icon = "🍬", label = "Funções"  },
+    { icon = "📊", label = "Status"   },
+    { icon = "🔔", label = "Log"      },
+    { icon = "⚙️", label = "Config"   },
+}
+
+local tabBtns       = {}
+local tabMenuOpen   = false
+local autoHideTimer = nil
+
+-- Cria os botões ATRÁS do painel (ZIndex = 5)
+for i, def in ipairs(tabDefs) do
+    local btn = Instance.new("TextButton")
+    btn.Name             = "TabBtn" .. i
+    btn.Size             = UDim2.fromOffset(TAB_BTN_SIZE, TAB_BTN_SIZE)
+    -- Posição inicial: escondida atrás do painel (X = painel.Position + pequeno offset)
+    btn.Position         = UDim2.new(0, 0, 0, 0)  -- será calculada após entrada
+    btn.BackgroundColor3 = Color3.fromRGB(30, 18, 48)
+    btn.Text             = def.icon
+    btn.TextSize         = 18
+    btn.FontFace         = FONT
+    btn.AutoButtonColor  = false
+    btn.ZIndex           = 5   -- ATRÁS do painel (ZIndex 10)
+    btn.Active           = false  -- não recebe cliques quando escondido
+    btn.Parent           = gui
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 10)
+
+    -- Gradiente igual ao painel
+    local bg = Instance.new("UIGradient")
+    bg.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(80, 45, 125)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(35, 18, 60)),
+    })
+    bg.Rotation = 135
+    bg.Parent   = btn
+
+    -- Borda com contraste
+    local bs = Instance.new("UIStroke")
+    bs.Thickness    = 1.5
+    bs.Color        = Color3.fromRGB(200, 140, 255)
+    bs.Transparency = 0.3
+    bs.Parent       = btn
+
+    -- Indicador de aba selecionada (linha na base)
+    local indicator = Instance.new("Frame")
+    indicator.Name             = "Indicator"
+    indicator.Size             = UDim2.new(0.7, 0, 0, 3)
+    indicator.Position         = UDim2.new(0.15, 0, 1, -5)
+    indicator.BackgroundColor3 = Color3.fromRGB(255, 160, 50)
+    indicator.BackgroundTransparency = 1  -- invisível por padrão
+    indicator.BorderSizePixel  = 0
+    indicator.ZIndex           = 6
+    indicator.Parent           = btn
+    Instance.new("UICorner", indicator).CornerRadius = UDim.new(1, 0)
+
+    tabBtns[i] = btn
+end
+
+-- Calcula posição dos botões relativa ao painel
+local function getTabBtnOpenPos(index)
+    -- Botões saem para a ESQUERDA do painel
+    -- Empilhados verticalmente, centralizados na altura do painel
+    local panelAbsPos  = panel.AbsolutePosition
+    local panelAbsSize = panel.AbsoluteSize
+
+    local totalH    = #tabDefs * TAB_BTN_SIZE + (#tabDefs - 1) * TAB_BTN_GAP
+    local startY    = panelAbsPos.Y + (panelAbsSize.Y / 2) - (totalH / 2)
+    local btnY      = startY + (index - 1) * (TAB_BTN_SIZE + TAB_BTN_GAP)
+    local btnX      = panelAbsPos.X - TAB_BTN_SIZE - 12  -- 12px de margem à esquerda
+
+    return UDim2.fromOffset(btnX, btnY)
+end
+
+local function getTabBtnHiddenPos(index)
+    -- Escondido atrás da borda esquerda do painel
+    local panelAbsPos  = panel.AbsolutePosition
+    local panelAbsSize = panel.AbsoluteSize
+
+    local totalH    = #tabDefs * TAB_BTN_SIZE + (#tabDefs - 1) * TAB_BTN_GAP
+    local startY    = panelAbsPos.Y + (panelAbsSize.Y / 2) - (totalH / 2)
+    local btnY      = startY + (index - 1) * (TAB_BTN_SIZE + TAB_BTN_GAP)
+    local btnX      = panelAbsPos.X  -- alinhado com a borda esquerda do painel
+
+    return UDim2.fromOffset(btnX, btnY)
+end
+
+local function updateIndicators()
+    for i, btn in ipairs(tabBtns) do
+        local ind = btn:FindFirstChild("Indicator")
+        if ind then
+            ind.BackgroundTransparency = (i == currentTab) and 0 or 1
+        end
+        -- Borda mais brilhante na aba ativa
+        local st = btn:FindFirstChildOfClass("UIStroke")
+        if st then
+            st.Color       = (i == currentTab)
+                and Color3.fromRGB(255, 180, 80)
+                or  Color3.fromRGB(200, 140, 255)
+            st.Transparency = (i == currentTab) and 0 or 0.3
+        end
+    end
+end
+
+local function cancelAutoHide()
+    if autoHideTimer then
+        task.cancel(autoHideTimer)
+        autoHideTimer = nil
+    end
+end
+
+local function scheduleAutoHide()
+    cancelAutoHide()
+    autoHideTimer = task.delay(AUTO_HIDE_TIME, function()
+        if not tabMenuOpen then return end
+        -- Anima fechamento
+        for i, btn in ipairs(tabBtns) do
+            local hiddenPos = getTabBtnHiddenPos(i)
+            local delay     = (i - 1) * 0.04
+            task.delay(delay, function()
+                TweenService:Create(btn,
+                    TweenInfo.new(0.25, Enum.EasingStyle.Cubic, Enum.EasingDirection.In), {
+                    Position        = hiddenPos,
+                    Size            = UDim2.fromOffset(0, TAB_BTN_SIZE),
+                    ImageTransparency = 1,
+                }):Play()
+                TweenService:Create(btn,
+                    TweenInfo.new(0.2, Enum.EasingStyle.Quad), {
+                    BackgroundTransparency = 1,
+                }):Play()
+            end)
+        end
+        task.delay(0.35, function()
+            tabMenuOpen = false
+            for _, btn in ipairs(tabBtns) do
+                btn.Active = false
+                btn.Size   = UDim2.fromOffset(TAB_BTN_SIZE, TAB_BTN_SIZE)
+                btn.BackgroundTransparency = 0
+            end
+        end)
+    end)
+end
+
+local function openTabMenu()
+    if tabMenuOpen then return end
+    tabMenuOpen = true
+
+    -- Atualiza posições baseadas na posição atual do painel
+    for i, btn in ipairs(tabBtns) do
+        local hiddenPos = getTabBtnHiddenPos(i)
+        local openPos   = getTabBtnOpenPos(i)
+
+        -- Inicia na posição escondida
+        btn.Position               = hiddenPos
+        btn.Size                   = UDim2.fromOffset(0, TAB_BTN_SIZE)
+        btn.BackgroundTransparency = 1
+        btn.Active                 = false
+
+        -- Animação escalonada: cada botão sai com delay
+        local delay = (i - 1) * 0.07
+        task.delay(delay, function()
+            btn.Active = true
+            TweenService:Create(btn,
+                TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+                Position               = openPos,
+                Size                   = UDim2.fromOffset(TAB_BTN_SIZE, TAB_BTN_SIZE),
+                BackgroundTransparency = 0,
+            }):Play()
+        end)
+    end
+
+    updateIndicators()
+    scheduleAutoHide()
+end
+
+local function closeTabMenu()
+    if not tabMenuOpen then return end
+    cancelAutoHide()
+
+    for i, btn in ipairs(tabBtns) do
+        local hiddenPos = getTabBtnHiddenPos(i)
+        local delay     = (i - 1) * 0.04
+
+        task.delay(delay, function()
+            btn.Active = false
+            TweenService:Create(btn,
+                TweenInfo.new(0.22, Enum.EasingStyle.Cubic, Enum.EasingDirection.In), {
+                Position               = hiddenPos,
+                Size                   = UDim2.fromOffset(0, TAB_BTN_SIZE),
+                BackgroundTransparency = 1,
+            }):Play()
+        end)
+    end
+
+    task.delay(0.35, function()
+        tabMenuOpen = false
+        for _, btn in ipairs(tabBtns) do
+            btn.Size                   = UDim2.fromOffset(TAB_BTN_SIZE, TAB_BTN_SIZE)
+            btn.BackgroundTransparency = 0
+        end
+    end)
+end
+
+-- Ativa aba ao clicar no botão
+for i, btn in ipairs(tabBtns) do
+    btn.Activated:Connect(function()
+        playClick()
+        selectTab(i)
+        updateIndicators()
+        cancelAutoHide()
+        scheduleAutoHide()
+    end)
+end
+
+-- ═══════════════════════════════════════════
+-- GESTO DE DESLIZE — borda esquerda do painel
+-- Zona de 20px na borda esquerda
+-- ═══════════════════════════════════════════
+local GESTURE_ZONE_W = 20
+local gestureActive  = false
+local gestureStartX  = nil
+local SWIPE_THRESHOLD = 30  -- pixels para considerar um swipe
+
+local gestureConn = UserInputService.InputBegan:Connect(function(input)
+    if input.UserInputType ~= Enum.UserInputType.Touch
+        and input.UserInputType ~= Enum.UserInputType.MouseButton1 then
+        return
+    end
+
+    local panelAbs  = panel.AbsolutePosition
+    local panelSize = panel.AbsoluteSize
+    local pos       = input.Position
+
+    -- Verifica se o toque está na zona de gesto (borda esquerda do painel)
+    local inZoneX = pos.X >= panelAbs.X and pos.X <= panelAbs.X + GESTURE_ZONE_W
+    local inZoneY = pos.Y >= panelAbs.Y and pos.Y <= panelAbs.Y + panelSize.Y
+
+    if inZoneX and inZoneY then
+        gestureActive = true
+        gestureStartX = pos.X
+    end
+end)
+
+local gestureEndConn = UserInputService.InputEnded:Connect(function(input)
+    if not gestureActive then return end
+    if input.UserInputType ~= Enum.UserInputType.Touch
+        and input.UserInputType ~= Enum.UserInputType.MouseButton1 then
+        return
+    end
+
+    local delta = gestureStartX - input.Position.X
+    gestureActive = false
+
+    if delta > SWIPE_THRESHOLD then
+        -- Swipe para a esquerda → abre
+        if not tabMenuOpen then
+            openTabMenu()
+        end
+    elseif delta < -SWIPE_THRESHOLD then
+        -- Swipe para a direita → fecha
+        if tabMenuOpen then
+            closeTabMenu()
+        end
+    end
+end)
+
+table.insert(GlobalConns, gestureConn)
+table.insert(GlobalConns, gestureEndConn)
 
 -- ═══════════════════════════════════════════
 -- MINIMIZAR
@@ -1164,11 +1620,16 @@ minBtn.Activated:Connect(function()
     playClick()
     minimized    = not minimized
     minBtn.Text  = minimized and "+" or "−"
+
     TweenService:Create(panel, EASING_RESIZE, {
         Size = minimized and MINI_SIZE or PANEL_SIZE,
     }):Play()
-    scrollFrame.Visible = not minimized
-    headerSep.Visible   = not minimized
+
+    tabContainer.Visible = not minimized
+    headerSep.Visible    = not minimized
+
+    -- Recolhe menu de abas ao minimizar
+    if minimized and tabMenuOpen then closeTabMenu() end
 end)
 
 -- ═══════════════════════════════════════════
@@ -1178,15 +1639,18 @@ closeBtn.Activated:Connect(function()
     playClick()
     stopAutoCandy()
     stopAutoPrompt()
-    if State.invis       then stopInvis()          end
-    if State.doorESP     then removeAllESP()       end
-    if State.instantDoor then removeInstantDoor()  end
-    if State.speedBoost  then stopSpeedBoost()     end
+    if State.invis       then stopInvis()         end
+    if State.doorESP     then removeAllESP()      end
+    if State.instantDoor then removeInstantDoor() end
+    if State.speedBoost  then stopSpeedBoost()    end
+    if statusUpdateConn  then statusUpdateConn:Disconnect() end
+    cancelAutoHide()
 
-    for _, conn in ipairs(GlobalConnections) do
-        conn:Disconnect()
-    end
-    GlobalConnections = {}
+    for _, conn in ipairs(GlobalConns) do conn:Disconnect() end
+    GlobalConns = {}
+
+    -- Remove botões de aba
+    for _, btn in ipairs(tabBtns) do btn:Destroy() end
 
     TweenService:Create(panel, TweenInfo.new(0.2, Enum.EasingStyle.Cubic), {
         BackgroundTransparency = 1,
@@ -1196,11 +1660,11 @@ closeBtn.Activated:Connect(function()
 end)
 
 -- ═══════════════════════════════════════════
--- ARRASTAR
+-- ARRASTAR — header, ignora botões fechar/min
 -- ═══════════════════════════════════════════
 local dragging    = false
 local dragStart   = nil
-local startPos    = nil
+local startPanelPos = nil
 local activeInput = nil
 
 header.InputBegan:Connect(function(input)
@@ -1215,9 +1679,10 @@ header.InputBegan:Connect(function(input)
         end
         if inside(closeBtn) or inside(minBtn) then return end
 
-        dragging  = true
-        dragStart = input.Position
-        startPos  = panel.Position
+        dragging      = true
+        dragStart     = input.Position
+        startPanelPos = panel.Position
+
         input.Changed:Connect(function()
             if input.UserInputState == Enum.UserInputState.End then
                 dragging = false
@@ -1237,39 +1702,34 @@ local dragConn = UserInputService.InputChanged:Connect(function(input)
     if dragging and input == activeInput then
         local delta = input.Position - dragStart
         panel.Position = UDim2.new(
-            startPos.X.Scale,
-            startPos.X.Offset + delta.X,
-            startPos.Y.Scale,
-            startPos.Y.Offset + delta.Y
+            startPanelPos.X.Scale,
+            startPanelPos.X.Offset + delta.X,
+            startPanelPos.Y.Scale,
+            startPanelPos.Y.Offset + delta.Y
         )
+        -- Recolhe o menu ao arrastar (posições mudariam)
+        if tabMenuOpen then closeTabMenu() end
     end
 end)
-table.insert(GlobalConnections, dragConn)
+table.insert(GlobalConns, dragConn)
 
 -- ═══════════════════════════════════════════
 -- RECONECTA AO RESPAWN
 -- ═══════════════════════════════════════════
 player.CharacterAdded:Connect(function(char)
-    -- Restaura invisibilidade se estava ativa
     if State.invis then
         task.wait(0.5)
         startInvis()
     end
-
-    -- FIX: restaura câmera com Humanoid do novo personagem
     local hum = char:WaitForChild("Humanoid", 5)
     if hum then
         camera.CameraType    = Enum.CameraType.Custom
         camera.CameraSubject = hum
     end
-
-    -- Restaura speed
     if State.speedBoost then
         task.wait(1)
         startSpeedBoost(speedValue)
     end
-
-    -- Reinicia loops
     if State.autoCandy then
         LoopFlags.autoCandy = false
         task.wait(2)
@@ -1290,8 +1750,9 @@ local function playEntrance()
     panel.BackgroundTransparency = 1
     TweenService:Create(panel, EASING_IN, {
         Size                   = PANEL_SIZE,
-        BackgroundTransparency = 0.1,
+        BackgroundTransparency = State.panelAlpha,
     }):Play()
 end
 
 playEntrance()
+addNotif("✅ Candy Collector V1 carregado")
